@@ -43,6 +43,13 @@ type segment struct {
 	count  int
 	cap    int     // capacity; default MaxFilesPerSegment, configurable for tuning
 	fp     float64 // target false-positive rate for this segment's filter
+	// tomb counts removals whose bits were left set in the filter since the last
+	// rebuild. A blocked Bloom filter can't clear a single key (shared bits), so
+	// remove leaves the bits stale — safe, since find() confirms every hit
+	// against the index, at the cost of a slightly higher false-positive rate.
+	// We rebuild only when tomb crosses a threshold, amortizing the costly
+	// re-tuning (NewBlockedTuned) to O(1) per remove while bounding the FP drift.
+	tomb int
 }
 
 func newSegment(capacity int, fp float64) *segment {
@@ -93,9 +100,12 @@ func (s *segment) find(h uint64, name string) (InodeID, bool) {
 	return 0, false // Bloom false positive (or hash-only collision)
 }
 
-// remove deletes name and rebuilds the filter from the surviving keys. A
-// classic Bloom filter cannot clear a single key (shared bits), so on any
-// removal we rebuild from scratch — microseconds for <=4000 keys (§3.3).
+// remove deletes name from the index, leaving its now-stale bits in the filter.
+// A blocked Bloom filter can't clear a single key (shared bits), and find()
+// confirms every hit against the index, so a stale set bit is harmless — it
+// only nudges the false-positive rate up. We defer the rebuild until enough
+// removals accumulate (rebuildThreshold), turning the O(cap) re-tuning into an
+// amortized O(1) cost per remove while keeping the FP drift bounded (§3.3).
 func (s *segment) remove(h uint64, name string) bool {
 	chain := s.index[h]
 	for i, e := range chain {
@@ -107,17 +117,32 @@ func (s *segment) remove(h uint64, name string) bool {
 				s.index[h] = chain[:len(chain)-1]
 			}
 			s.count--
-			s.rebuildFilter()
+			s.tomb++
+			if s.tomb >= s.rebuildThreshold() {
+				s.rebuildFilter()
+			}
 			return true
 		}
 	}
 	return false
 }
 
-// rebuildFilter discards the old filter and rebuilds it from the live keys
-// (§3.3). In a concurrent design the new filter would be swapped in atomically;
-// Stage A is single-threaded.
+// rebuildThreshold is the number of stale (removed-but-not-cleared) keys we
+// tolerate before rebuilding. cap/4 bounds the filter's over-population to
+// ~1.25x capacity at the moment of rebuild — a modest, bounded FP increase —
+// while making rebuilds rare enough that their tuning cost amortizes away.
+func (s *segment) rebuildThreshold() int {
+	if t := s.cap / 4; t > 1 {
+		return t
+	}
+	return 1
+}
+
+// rebuildFilter discards the old filter and rebuilds it from the live keys,
+// dropping all accumulated stale bits (§3.3). In a concurrent design the new
+// filter would be swapped in atomically; Stage A is single-threaded.
 func (s *segment) rebuildFilter() {
+	s.tomb = 0
 	f := bloom.NewBlockedTuned(uint(s.cap), s.fp)
 	for _, chain := range s.index {
 		for _, e := range chain {

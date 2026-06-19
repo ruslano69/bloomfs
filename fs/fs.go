@@ -98,11 +98,84 @@ type FS struct {
 	clock func() uint64
 }
 
+// dirPageSize is the directory persistence unit: one entry list is split across
+// fixed 4 KiB pages, each persisted as exactly one data record. A single
+// create/unlink rewrites only the one page it touches (record-addressable
+// WriteAt carries the rest over by ref), so a name change costs O(1) crypto
+// work instead of re-serializing the whole directory (the old write-amplifying
+// storeDir). Names are NAME_MAX-bounded, so an entry always fits in a page.
+const dirPageSize = 4096
+
 // cachedDir is a resident open directory: its in-memory Bloom-segmented index
-// plus the inode it persists to.
+// (the lookup authority) plus the page layout it persists to. The two are kept
+// in sync through add/del; pages/pageOf describe where each name's bytes live so
+// a mutation can rewrite just the affected page.
 type cachedDir struct {
-	dir *dir.Directory
-	in  *inode.Inode
+	dir    *dir.Directory
+	in     *inode.Inode
+	pages  [][]dir.Entry    // entries grouped by page index (on-disk layout)
+	used   []int            // bytes occupied per page, including the count header
+	pageOf map[string]int   // name -> page index, for locating a name on delete
+	dirty  map[int]struct{} // pages changed since the last flush
+}
+
+// entryBytes is the on-disk size of one directory entry: a 10-byte header
+// (nameLen u16 + inode u64) plus the name.
+func entryBytes(name string) int { return 10 + len(name) }
+
+// add links name -> id in both the Bloom index and the page layout, marking the
+// chosen page dirty. It returns false if name already exists. New entries fill
+// the first page with room (reusing space freed by deletes) or open a new page.
+func (h *cachedDir) add(name string, id dir.InodeID) bool {
+	if !h.dir.Add(name, id) {
+		return false
+	}
+	need := entryBytes(name)
+	p := -1
+	for i, u := range h.used {
+		if u+need <= dirPageSize {
+			p = i
+			break
+		}
+	}
+	if p < 0 {
+		p = len(h.pages)
+		h.pages = append(h.pages, nil)
+		h.used = append(h.used, 4) // 4-byte page header (entry count)
+	}
+	h.pages[p] = append(h.pages[p], dir.Entry{Name: name, Inode: id})
+	h.used[p] += need
+	h.pageOf[name] = p
+	h.markDirty(p)
+	return true
+}
+
+// del unlinks name from both the Bloom index and its page, marking that page
+// dirty. It returns false if name was not present.
+func (h *cachedDir) del(name string) bool {
+	p, ok := h.pageOf[name]
+	if !ok {
+		return false
+	}
+	h.dir.Delete(name)
+	page := h.pages[p]
+	for i, e := range page {
+		if e.Name == name {
+			h.pages[p] = append(page[:i], page[i+1:]...)
+			break
+		}
+	}
+	h.used[p] -= entryBytes(name)
+	delete(h.pageOf, name)
+	h.markDirty(p)
+	return true
+}
+
+func (h *cachedDir) markDirty(p int) {
+	if h.dirty == nil {
+		h.dirty = make(map[int]struct{})
+	}
+	h.dirty[p] = struct{}{}
 }
 
 // Format creates a fresh filesystem on dev and returns it mounted. A nil key
@@ -417,8 +490,10 @@ func (f *FS) openDir(id uint64) (*cachedDir, error) {
 	return actual.(*cachedDir), nil
 }
 
-// loadDirFromDisk reads a directory inode and rebuilds its Bloom-segmented index
-// from the persisted entries (§3.3 rebuild-from-keys).
+// loadDirFromDisk reads a directory inode and rebuilds both its Bloom-segmented
+// index (§3.3 rebuild-from-keys) and its page layout. The data is a sequence of
+// fixed dirPageSize pages; each is decoded independently so the in-RAM layout
+// mirrors the on-disk one and later flushes can rewrite individual pages.
 func (f *FS) loadDirFromDisk(id uint64) (*cachedDir, error) {
 	in, err := f.inodes.Get(id)
 	if err != nil {
@@ -431,21 +506,39 @@ func (f *FS) loadDirFromDisk(id uint64) (*cachedDir, error) {
 	if err != nil {
 		return nil, err
 	}
-	entries, err := decodeDirEntries(blob)
-	if err != nil {
-		return nil, err
+	h := &cachedDir{dir: dir.New(), in: in, pageOf: make(map[string]int)}
+	for off := 0; off < len(blob); off += dirPageSize {
+		end := off + dirPageSize
+		if end > len(blob) {
+			end = len(blob)
+		}
+		entries, used, err := decodeDirPage(blob[off:end])
+		if err != nil {
+			return nil, err
+		}
+		p := len(h.pages)
+		h.pages = append(h.pages, entries)
+		h.used = append(h.used, used)
+		for _, e := range entries {
+			h.dir.Add(e.Name, e.Inode)
+			h.pageOf[e.Name] = p
+		}
 	}
-	d := dir.New()
-	for _, e := range entries {
-		d.Add(e.Name, e.Inode)
-	}
-	return &cachedDir{dir: d, in: in}, nil
+	return h, nil
 }
 
-// storeDir serializes a cached directory back into its inode. Caller holds the
-// write lock (the cached directory was just mutated).
-func (f *FS) storeDir(id uint64, h *cachedDir) error {
-	return f.setData(id, h.in, encodeDirEntries(h.dir.Entries()))
+// flushDir persists every page changed since the last flush, each as one
+// record-addressable WriteAt at its fixed page offset — so untouched pages keep
+// their existing refs (no re-hash, no re-encrypt) and only the dirty pages cost
+// pipeline work. Caller holds the write lock.
+func (f *FS) flushDir(id uint64, h *cachedDir) error {
+	for p := range h.dirty {
+		if err := f.writeAtLocked(id, h.in, uint64(p)*dirPageSize, encodeDirPage(h.pages[p])); err != nil {
+			return err
+		}
+	}
+	h.dirty = nil
+	return nil
 }
 
 // --- VFS operations ---
@@ -695,13 +788,13 @@ func (f *FS) createLocked(parent uint64, name string, typ uint8, mode uint16) (u
 	if err := f.inodes.Put(id, child); err != nil {
 		return 0, err
 	}
-	h.dir.Add(name, dir.InodeID(id))
+	h.add(name, dir.InodeID(id))
 	// A new subdirectory's ".." links back to the parent, so the parent's link
-	// count grows by one (POSIX directory nlink). storeDir persists h.in below.
+	// count grows by one (POSIX directory nlink). flushDir persists h.in below.
 	if typ == inode.TypeDir {
 		h.in.Nlink++
 	}
-	if err := f.storeDir(parent, h); err != nil {
+	if err := f.flushDir(parent, h); err != nil {
 		return 0, err
 	}
 	return id, nil
@@ -1016,8 +1109,8 @@ func (f *FS) Unlink(parent uint64, name string) error {
 		return ErrIsDir // directories are removed with Rmdir (POSIX EISDIR)
 	}
 
-	h.dir.Delete(name)
-	if err := f.storeDir(parent, h); err != nil {
+	h.del(name)
+	if err := f.flushDir(parent, h); err != nil {
 		return err
 	}
 
@@ -1061,11 +1154,11 @@ func (f *FS) Rmdir(parent uint64, name string) error {
 		return ErrNotEmpty
 	}
 
-	h.dir.Delete(name)
+	h.del(name)
 	if h.in.Nlink > 0 {
 		h.in.Nlink-- // the child's ".." no longer counts toward the parent
 	}
-	if err := f.storeDir(parent, h); err != nil {
+	if err := f.flushDir(parent, h); err != nil {
 		return err
 	}
 	return f.reclaim(uint64(id), child)
@@ -1089,7 +1182,7 @@ func (f *FS) reclaim(id uint64, in *inode.Inode) error {
 
 // mutateInode applies fn to inode id and persists it, keeping the open-directory
 // cache coherent: if id is a cached directory, fn mutates the cached copy (h.in)
-// — the very struct storeDir later serializes — so a metadata change can't be
+// — the very struct flushDir later serializes — so a metadata change can't be
 // silently overwritten by a subsequent directory write (and vice versa). Caller
 // holds the write lock.
 func (f *FS) mutateInode(id uint64, fn func(*inode.Inode)) error {
@@ -1163,8 +1256,8 @@ func (f *FS) Link(parent uint64, name string, targetID uint64) error {
 	if err := f.inodes.Put(targetID, target); err != nil {
 		return err
 	}
-	h.dir.Add(name, dir.InodeID(targetID))
-	return f.storeDir(parent, h)
+	h.add(name, dir.InodeID(targetID))
+	return f.flushDir(parent, h)
 }
 
 // Rename moves srcName in srcParent to dstName in dstParent. If dstName already
@@ -1217,11 +1310,11 @@ func (f *FS) Rename(srcParent uint64, srcName string, dstParent uint64, dstName 
 				return err
 			}
 		}
-		dh.dir.Delete(dstName)
+		dh.del(dstName)
 	}
 
-	dh.dir.Add(dstName, id)
-	sh.dir.Delete(srcName)
+	dh.add(dstName, id)
+	sh.del(srcName)
 
 	// The renamed inode's ctime changes (its link/location changed), §F6.
 	if moved, err := f.inodes.Get(uint64(id)); err == nil {
@@ -1232,14 +1325,15 @@ func (f *FS) Rename(srcParent uint64, srcName string, dstParent uint64, dstName 
 	}
 
 	// Persist destination first, then source. If src == dst they are the same
-	// cached handle, so a single store covers both edits.
+	// cached handle, so a single flush covers both edits (add and del marked
+	// their pages dirty on the one handle).
 	if dstParent == srcParent {
-		return f.storeDir(srcParent, sh)
+		return f.flushDir(srcParent, sh)
 	}
-	if err := f.storeDir(dstParent, dh); err != nil {
+	if err := f.flushDir(dstParent, dh); err != nil {
 		return err
 	}
-	return f.storeDir(srcParent, sh)
+	return f.flushDir(srcParent, sh)
 }
 
 // Fsync makes all changes durable (POSIX fsync, §E7). BloomFS gives the strong
@@ -1308,45 +1402,46 @@ func (h *Handle) Close() error {
 	return nil
 }
 
-// --- directory entry serialization ---
+// --- directory page serialization ---
 //
-// Layout: count u32, then per entry: nameLen u16, inode u64, name bytes.
+// A page is a fixed dirPageSize buffer: count u32, then per entry nameLen u16,
+// inode u64, name bytes; the remainder is zero padding. The caller guarantees
+// the entries fit (used <= dirPageSize), so encoding never overflows.
 
-func encodeDirEntries(entries []dir.Entry) []byte {
-	buf := make([]byte, 4)
+func encodeDirPage(entries []dir.Entry) []byte {
+	buf := make([]byte, dirPageSize)
 	binary.LittleEndian.PutUint32(buf, uint32(len(entries)))
-	var hdr [10]byte
+	off := 4
 	for _, e := range entries {
-		binary.LittleEndian.PutUint16(hdr[0:], uint16(len(e.Name)))
-		binary.LittleEndian.PutUint64(hdr[2:], uint64(e.Inode))
-		buf = append(buf, hdr[:]...)
-		buf = append(buf, e.Name...)
+		binary.LittleEndian.PutUint16(buf[off:], uint16(len(e.Name)))
+		binary.LittleEndian.PutUint64(buf[off+2:], uint64(e.Inode))
+		off += 10
+		off += copy(buf[off:], e.Name)
 	}
 	return buf
 }
 
-func decodeDirEntries(b []byte) ([]dir.Entry, error) {
-	if len(b) == 0 {
-		return nil, nil
-	}
+// decodeDirPage parses one page, returning its entries and the byte count they
+// occupy (including the 4-byte header) for the page's room accounting.
+func decodeDirPage(b []byte) ([]dir.Entry, int, error) {
 	if len(b) < 4 {
-		return nil, ErrCorrupt
+		return nil, 0, ErrCorrupt
 	}
 	n := binary.LittleEndian.Uint32(b)
 	off := 4
 	out := make([]dir.Entry, 0, n)
 	for i := uint32(0); i < n; i++ {
 		if off+10 > len(b) {
-			return nil, fmt.Errorf("%w: truncated header", ErrCorrupt)
+			return nil, 0, fmt.Errorf("%w: truncated header", ErrCorrupt)
 		}
 		nl := int(binary.LittleEndian.Uint16(b[off:]))
 		id := dir.InodeID(binary.LittleEndian.Uint64(b[off+2:]))
 		off += 10
 		if off+nl > len(b) {
-			return nil, fmt.Errorf("%w: truncated name", ErrCorrupt)
+			return nil, 0, fmt.Errorf("%w: truncated name", ErrCorrupt)
 		}
 		out = append(out, dir.Entry{Name: string(b[off : off+nl]), Inode: id})
 		off += nl
 	}
-	return out, nil
+	return out, off, nil
 }

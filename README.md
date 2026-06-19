@@ -105,6 +105,13 @@ filesystems like ZFS; the Bloom-segmented lookup is what BloomFS adds.
   coerced back to 0644. Verified on a real mount: `chmod 000/600/755` hold,
   read-through-a-held-fd after `rm`, `O_TRUNC`-on-open, and `EACCES` writing into a
   `0500` directory.
+- [x] **Directory write-path optimization** — a directory mutation no longer
+  rewrites the whole directory blob. The blob is split into 4 KiB pages (one
+  record each), so create/unlink rewrites only the touched page via addressable
+  `WriteAt` (untouched pages carry over by ref, no re-hash/re-encrypt); and the
+  per-segment Bloom filter is rebuilt lazily (amortized, on accumulated
+  removals) instead of on every unlink. `BenchmarkCreateUnlink` on a 4000-entry
+  directory dropped ~35× (5.99 ms → 170 µs/op) with lookup latency unchanged.
 - [ ] **Stage F** — Rust port (and real BLAKE3, see notes)
 
 ## Design pipeline (data path)
