@@ -92,13 +92,10 @@ func (d *Directory) Segments() int { return len(d.segments) }
 // List returns every name in the directory (readdir, §B12). The Bloom filter is
 // useless for listing, so this walks all segments. Order is unspecified.
 func (d *Directory) List() []string {
-	names := make([]string, 0, d.Len())
-	for _, s := range d.segments {
-		for _, chain := range s.index {
-			for _, e := range chain {
-				names = append(names, e.name)
-			}
-		}
+	entries := d.Entries()
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name
 	}
 	return names
 }

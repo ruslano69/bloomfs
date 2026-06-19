@@ -7,19 +7,14 @@ import (
 	"github.com/ruslano69/bloomfs/alloc"
 	"github.com/ruslano69/bloomfs/block"
 	"github.com/ruslano69/bloomfs/dedup"
-	"github.com/ruslano69/bloomfs/layout"
 )
 
 // newStore formats an in-memory image and returns a BlockStore plus the device.
 func newStore(t *testing.T) (*BlockStore, block.Device) {
 	t.Helper()
 	dev := block.NewMem(512)
-	sb, err := layout.Format(dev, 1000)
-	if err != nil {
-		t.Fatalf("format: %v", err)
-	}
 	a := alloc.New(dev.Blocks())
-	a.Reserve(0, sb.DataStart) // keep the allocator out of metadata
+	a.Reserve(0, 64) // stand in for the metadata region the allocator must avoid
 
 	key := make([]byte, 64) // AES-256-XTS
 	for i := range key {
