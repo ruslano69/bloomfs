@@ -1,0 +1,14 @@
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# Filesystem images produced by tests / demos
+*.img
+*.bin
+
+# Editor / OS noise
+.idea/
+.vscode/
+*~
+.DS_Store
