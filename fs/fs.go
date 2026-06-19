@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/ruslano69/bloomfs/alloc"
 	"github.com/ruslano69/bloomfs/block"
@@ -44,14 +45,33 @@ var (
 	ErrCorrupt  = errors.New("fs: corrupt directory data")
 )
 
-// FS is a mounted BloomFS instance. Not safe for concurrent use (locking is §B6).
+// FS is a mounted BloomFS instance.
+//
+// Concurrency (§B6): a single RWMutex gives the read/write contract that the
+// kernel's parallel Lookup bombardment needs — many concurrent readers
+// (Lookup/Readdir/ReadFile), one exclusive writer (Mkdir/Create/WriteFile/
+// Unlink/Commit). Open directories are cached (dcache) so a hot Lookup is a
+// pure RAM hit on the Bloom-segmented index instead of a disk read + decrypt +
+// decompress + rebuild. The cache is a sync.Map so concurrent readers can
+// populate it; the cached directory's contents are only mutated under the
+// exclusive write lock, so readers never race a writer.
 type FS struct {
+	mu     sync.RWMutex
+	dcache sync.Map // uint64 inode id -> *cachedDir (open-directory cache, §B11)
+
 	dev    block.Device
 	ub     *cow.Uberblock
 	bm     *alloc.Bitmap
 	ddt    *dedup.Table
 	inodes *inode.Store
 	bs     *store.BlockStore
+}
+
+// cachedDir is a resident open directory: its in-memory Bloom-segmented index
+// plus the inode it persists to.
+type cachedDir struct {
+	dir *dir.Directory
+	in  *inode.Inode
 }
 
 // Format creates a fresh filesystem on dev and returns it mounted. A nil key
@@ -97,10 +117,21 @@ func Mount(dev block.Device, key []byte) (*FS, error) {
 }
 
 // Root returns the root directory's inode id.
-func (f *FS) Root() uint64 { return f.ub.RootInode }
+func (f *FS) Root() uint64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.ub.RootInode
+}
 
 // Commit persists the current state durably (CoW transaction, §B1).
 func (f *FS) Commit() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.commitLocked()
+}
+
+// commitLocked performs the commit assuming the write lock is held.
+func (f *FS) commitLocked() error {
 	ub, err := cow.Commit(f.dev, f.ub, f.bm, f.ddt, f.ub.RootInode, f.ub.NextInode)
 	if err != nil {
 		return err
@@ -154,64 +185,87 @@ func (f *FS) getData(in *inode.Inode) ([]byte, error) {
 
 // --- directory helpers ---
 
-// loadDir reads a directory inode and rebuilds its in-memory index (Bloom
-// segments + XXH3) from the persisted entries (§3.3 rebuild-from-keys).
-func (f *FS) loadDir(id uint64) (*dir.Directory, *inode.Inode, error) {
+// openDir returns the resident open directory for id, loading and caching it on
+// first access (so a hot Lookup is a RAM hit, not a disk read + decrypt +
+// decompress + rebuild). Caller holds f.mu (read or write).
+func (f *FS) openDir(id uint64) (*cachedDir, error) {
+	if v, ok := f.dcache.Load(id); ok {
+		return v.(*cachedDir), nil
+	}
+	h, err := f.loadDirFromDisk(id)
+	if err != nil {
+		return nil, err
+	}
+	// Two concurrent readers may both load on a miss; LoadOrStore keeps one.
+	actual, _ := f.dcache.LoadOrStore(id, h)
+	return actual.(*cachedDir), nil
+}
+
+// loadDirFromDisk reads a directory inode and rebuilds its Bloom-segmented index
+// from the persisted entries (§3.3 rebuild-from-keys).
+func (f *FS) loadDirFromDisk(id uint64) (*cachedDir, error) {
 	in, err := f.inodes.Get(id)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if in.Type != inode.TypeDir {
-		return nil, nil, ErrNotDir
+		return nil, ErrNotDir
 	}
 	blob, err := f.getData(in)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	d := dir.New()
 	entries, err := decodeDirEntries(blob)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
+	d := dir.New()
 	for _, e := range entries {
 		d.Add(e.Name, e.Inode)
 	}
-	return d, in, nil
+	return &cachedDir{dir: d, in: in}, nil
 }
 
-// storeDir serializes a directory's entries back into its inode.
-func (f *FS) storeDir(id uint64, in *inode.Inode, d *dir.Directory) error {
-	return f.setData(id, in, encodeDirEntries(d.Entries()))
+// storeDir serializes a cached directory back into its inode. Caller holds the
+// write lock (the cached directory was just mutated).
+func (f *FS) storeDir(id uint64, h *cachedDir) error {
+	return f.setData(id, h.in, encodeDirEntries(h.dir.Entries()))
 }
 
 // --- VFS operations ---
 
 // Lookup resolves name in directory parent to an inode id.
 func (f *FS) Lookup(parent uint64, name string) (uint64, bool, error) {
-	d, _, err := f.loadDir(parent)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	h, err := f.openDir(parent)
 	if err != nil {
 		return 0, false, err
 	}
-	id, ok := d.Find(name)
+	id, ok := h.dir.Find(name)
 	return uint64(id), ok, nil
 }
 
 // Readdir lists the names in directory id.
 func (f *FS) Readdir(id uint64) ([]string, error) {
-	d, _, err := f.loadDir(id)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	h, err := f.openDir(id)
 	if err != nil {
 		return nil, err
 	}
-	return d.List(), nil
+	return h.dir.List(), nil
 }
 
 // create adds a new inode of the given type under parent/name.
 func (f *FS) create(parent uint64, name string, typ uint8, perms uint8) (uint64, error) {
-	d, pin, err := f.loadDir(parent)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	h, err := f.openDir(parent)
 	if err != nil {
 		return 0, err
 	}
-	if _, ok := d.Find(name); ok {
+	if _, ok := h.dir.Find(name); ok {
 		return 0, ErrExists
 	}
 	id := f.allocInode()
@@ -222,8 +276,8 @@ func (f *FS) create(parent uint64, name string, typ uint8, perms uint8) (uint64,
 	if err := f.inodes.Put(id, child); err != nil {
 		return 0, err
 	}
-	d.Add(name, dir.InodeID(id))
-	if err := f.storeDir(parent, pin, d); err != nil {
+	h.dir.Add(name, dir.InodeID(id))
+	if err := f.storeDir(parent, h); err != nil {
 		return 0, err
 	}
 	return id, nil
@@ -241,6 +295,8 @@ func (f *FS) Create(parent uint64, name string) (uint64, error) {
 
 // WriteFile replaces the contents of regular file id.
 func (f *FS) WriteFile(id uint64, data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	in, err := f.inodes.Get(id)
 	if err != nil {
 		return err
@@ -253,6 +309,8 @@ func (f *FS) WriteFile(id uint64, data []byte) error {
 
 // ReadFile returns the contents of regular file id.
 func (f *FS) ReadFile(id uint64) ([]byte, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	in, err := f.inodes.Get(id)
 	if err != nil {
 		return nil, err
@@ -265,11 +323,13 @@ func (f *FS) ReadFile(id uint64) ([]byte, error) {
 
 // Unlink removes name from directory parent, releasing the child's data.
 func (f *FS) Unlink(parent uint64, name string) error {
-	d, pin, err := f.loadDir(parent)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	h, err := f.openDir(parent)
 	if err != nil {
 		return err
 	}
-	id, ok := d.Find(name)
+	id, ok := h.dir.Find(name)
 	if !ok {
 		return ErrNotFound
 	}
@@ -280,10 +340,10 @@ func (f *FS) Unlink(parent uint64, name string) error {
 	if child.Size > 0 { // free the child's data extent
 		f.bs.Release(store.UnmarshalRef(child.BlockMap[:store.RefSize]))
 	}
-	if !d.Delete(name) {
+	if !h.dir.Delete(name) {
 		return ErrNotFound
 	}
-	return f.storeDir(parent, pin, d)
+	return f.storeDir(parent, h)
 }
 
 // --- directory entry serialization ---

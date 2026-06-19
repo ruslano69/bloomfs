@@ -2,6 +2,8 @@ package fs
 
 import (
 	"bytes"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/ruslano69/bloomfs/block"
@@ -22,6 +24,103 @@ func contains(s []string, x string) bool {
 		}
 	}
 	return false
+}
+
+// countingDev counts ReadBlock calls, to prove the open-directory cache avoids
+// re-reading (and re-decrypting + re-decompressing + rebuilding) a directory on
+// every Lookup.
+type countingDev struct {
+	block.Device
+	reads int
+}
+
+func (d *countingDev) ReadBlock(n uint64) ([]byte, error) {
+	d.reads++
+	return d.Device.ReadBlock(n)
+}
+
+func TestDirCacheAvoidsReReads(t *testing.T) {
+	cd := &countingDev{Device: block.NewMem(4096)}
+	f, err := Format(cd, testKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := f.Root()
+	if _, err := f.Create(root, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Create(root, "b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	f.Lookup(root, "a") // warm the cache
+	before := cd.reads
+	for i := 0; i < 100; i++ {
+		if _, ok, _ := f.Lookup(root, "a"); !ok {
+			t.Fatal("a missing")
+		}
+		if _, ok, _ := f.Lookup(root, "b"); !ok {
+			t.Fatal("b missing")
+		}
+	}
+	if cd.reads != before {
+		t.Fatalf("dir cache ineffective: %d extra ReadBlock over 200 cached lookups", cd.reads-before)
+	}
+}
+
+// TestConcurrentLookup hammers Lookup + ReadFile from many goroutines. Run with
+// -race: it proves the read path is concurrency-safe (many readers, no writer).
+func TestConcurrentLookup(t *testing.T) {
+	f, err := Format(block.NewMem(8192), testKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := f.Root()
+
+	const n = 200
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("f%03d", i)
+		id, err := f.Create(root, name)
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		if err := f.WriteFile(id, []byte(name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	errc := make(chan error, 16)
+	for g := 0; g < 16; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < n; i++ {
+				name := fmt.Sprintf("f%03d", (i+g)%n)
+				id, ok, err := f.Lookup(root, name)
+				if err != nil || !ok {
+					errc <- fmt.Errorf("lookup %s: ok=%v err=%w", name, ok, err)
+					return
+				}
+				data, err := f.ReadFile(id)
+				if err != nil || string(data) != name {
+					errc <- fmt.Errorf("read %s: got %q err=%w", name, data, err)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errc)
+	for err := range errc {
+		t.Error(err)
+	}
 }
 
 // TestEndToEndPersist is the headline Stage D check: build a directory tree with

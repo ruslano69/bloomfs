@@ -37,7 +37,9 @@ filesystems like ZFS; the Bloom-segmented lookup is what BloomFS adds.
 - [x] **Stage D** — Copy-on-Write transactions + crash recovery
 - [x] **VFS integration** — `dir`+`inode`+`store`+`cow` as one persistent
   filesystem (`fs` package); end-to-end build → commit → remount → read back,
-  tested without a kernel mount
+  tested without a kernel mount. Concurrency-safe (RWMutex: parallel readers,
+  exclusive writer — validated under `-race`) with an open-directory cache so a
+  hot `Lookup` is a RAM hit, not a disk read + decrypt + decompress + rebuild.
 - [ ] **Stage E** — FUSE/WinFsp binding + permissions + page cache + quotas
 - [ ] **Stage F** — Rust port (and real BLAKE3, see notes)
 
