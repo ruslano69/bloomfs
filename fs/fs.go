@@ -65,6 +65,11 @@ type FS struct {
 	ddt    *dedup.Table
 	inodes *inode.Store
 	bs     *store.BlockStore
+
+	// openCount tracks live open handles per inode (RAM-only). A file with
+	// Nlink == 0 (no names) but openCount > 0 stays alive until the last Close
+	// (POSIX unlink-of-open-file, §E3). Not persisted: a crash drops all handles.
+	openCount map[uint64]uint32
 }
 
 // cachedDir is a resident open directory: its in-memory Bloom-segmented index
@@ -107,12 +112,13 @@ func Mount(dev block.Device, key []byte) (*FS, error) {
 		return nil, err
 	}
 	return &FS{
-		dev:    dev,
-		ub:     ub,
-		bm:     bm,
-		ddt:    ddt,
-		inodes: inode.NewStore(dev, ub.InodeTable),
-		bs:     bs,
+		dev:       dev,
+		ub:        ub,
+		bm:        bm,
+		ddt:       ddt,
+		inodes:    inode.NewStore(dev, ub.InodeTable),
+		bs:        bs,
+		openCount: make(map[uint64]uint32),
 	}, nil
 }
 
@@ -321,7 +327,10 @@ func (f *FS) ReadFile(id uint64) ([]byte, error) {
 	return f.getData(in)
 }
 
-// Unlink removes name from directory parent, releasing the child's data.
+// Unlink removes name from directory parent. The link count drops by one; the
+// inode and its data are reclaimed only when no names remain (Nlink == 0, §E4)
+// AND no open handle references it (openCount == 0, §E3) — otherwise the file
+// stays readable through its handle until the last Close.
 func (f *FS) Unlink(parent uint64, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -337,13 +346,181 @@ func (f *FS) Unlink(parent uint64, name string) error {
 	if err != nil {
 		return err
 	}
-	if child.Size > 0 { // free the child's data extent
-		f.bs.Release(store.UnmarshalRef(child.BlockMap[:store.RefSize]))
+
+	h.dir.Delete(name)
+	if err := f.storeDir(parent, h); err != nil {
+		return err
 	}
-	if !h.dir.Delete(name) {
+
+	if child.Nlink > 0 {
+		child.Nlink--
+	}
+	if child.Nlink == 0 && f.openCount[uint64(id)] == 0 {
+		return f.reclaim(uint64(id), child)
+	}
+	return f.inodes.Put(uint64(id), child) // persist the decremented link count
+}
+
+// reclaim frees an inode's data and clears it (caller holds the write lock). The
+// inode slot itself is leaked under the bump allocator; a free-inode list is a
+// later refinement (§B2).
+func (f *FS) reclaim(id uint64, in *inode.Inode) error {
+	if in.Size > 0 {
+		f.bs.Release(store.UnmarshalRef(in.BlockMap[:store.RefSize]))
+	}
+	return f.inodes.Put(id, &inode.Inode{}) // zeroed: Nlink 0, Size 0, no data
+}
+
+// Link creates a hard link: a second name in parent pointing at an existing
+// non-directory inode (§E4). POSIX forbids hard links to directories.
+func (f *FS) Link(parent uint64, name string, targetID uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	target, err := f.inodes.Get(targetID)
+	if err != nil {
+		return err
+	}
+	if target.Type == inode.TypeDir {
+		return ErrNotFile
+	}
+	h, err := f.openDir(parent)
+	if err != nil {
+		return err
+	}
+	if _, ok := h.dir.Find(name); ok {
+		return ErrExists
+	}
+	target.Nlink++
+	if err := f.inodes.Put(targetID, target); err != nil {
+		return err
+	}
+	h.dir.Add(name, dir.InodeID(targetID))
+	return f.storeDir(parent, h)
+}
+
+// Rename moves srcName in srcParent to dstName in dstParent. If dstName already
+// exists it is atomically replaced (its link count drops, reclaimed if it hits
+// zero, §E1/§E2). Atomicity holds across Commit/Fsync: after a successful
+// commit you observe either the old or the new layout, never a half state (the
+// CoW transaction, §B1). The intra-session window is bounded by the
+// inode-table-in-place limitation (documented).
+func (f *FS) Rename(srcParent uint64, srcName string, dstParent uint64, dstName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	sh, err := f.openDir(srcParent)
+	if err != nil {
+		return err
+	}
+	id, ok := sh.dir.Find(srcName)
+	if !ok {
 		return ErrNotFound
 	}
-	return f.storeDir(parent, h)
+	dh, err := f.openDir(dstParent)
+	if err != nil {
+		return err
+	}
+
+	// Overwrite: drop the existing destination's link first.
+	if oldID, ok := dh.dir.Find(dstName); ok {
+		if uint64(oldID) == uint64(id) { // renaming onto itself: no-op
+			return nil
+		}
+		old, err := f.inodes.Get(uint64(oldID))
+		if err != nil {
+			return err
+		}
+		if old.Nlink > 0 {
+			old.Nlink--
+		}
+		if old.Nlink == 0 && f.openCount[uint64(oldID)] == 0 {
+			if err := f.reclaim(uint64(oldID), old); err != nil {
+				return err
+			}
+		} else if err := f.inodes.Put(uint64(oldID), old); err != nil {
+			return err
+		}
+		dh.dir.Delete(dstName)
+	}
+
+	dh.dir.Add(dstName, id)
+	sh.dir.Delete(srcName)
+
+	// Persist destination first, then source. If src == dst they are the same
+	// cached handle, so a single store covers both edits.
+	if dstParent == srcParent {
+		return f.storeDir(srcParent, sh)
+	}
+	if err := f.storeDir(dstParent, dh); err != nil {
+		return err
+	}
+	return f.storeDir(srcParent, sh)
+}
+
+// Fsync makes all changes durable (POSIX fsync, §E7). BloomFS gives the strong
+// guarantee: after Fsync returns successfully, the data survives power loss.
+// It is the CoW commit point (§B1).
+func (f *FS) Fsync() error { return f.Commit() }
+
+// Handle is an open reference to a file. It keeps the inode alive even after the
+// file is unlinked, until Close (§E3).
+type Handle struct {
+	fs     *FS
+	id     uint64
+	closed bool
+}
+
+// Open returns a handle to regular file id and records the open reference.
+func (f *FS) Open(id uint64) (*Handle, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	in, err := f.inodes.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	if in.Type != inode.TypeRegular {
+		return nil, ErrNotFile
+	}
+	f.openCount[id]++
+	return &Handle{fs: f, id: id}, nil
+}
+
+// Read returns the file's current contents through the handle — this works even
+// if the file has been unlinked (§E3).
+func (h *Handle) Read() ([]byte, error) {
+	h.fs.mu.RLock()
+	defer h.fs.mu.RUnlock()
+	in, err := h.fs.inodes.Get(h.id)
+	if err != nil {
+		return nil, err
+	}
+	return h.fs.getData(in)
+}
+
+// Close drops the open reference. If the file was unlinked while open and this
+// is the last handle, its storage is reclaimed now (§E3).
+func (h *Handle) Close() error {
+	h.fs.mu.Lock()
+	defer h.fs.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closed = true
+	f := h.fs
+	if f.openCount[h.id] > 0 {
+		f.openCount[h.id]--
+	}
+	if f.openCount[h.id] == 0 {
+		delete(f.openCount, h.id)
+		in, err := f.inodes.Get(h.id)
+		if err != nil {
+			return err
+		}
+		if in.Nlink == 0 { // unlinked while open: reclaim now
+			return f.reclaim(h.id, in)
+		}
+	}
+	return nil
 }
 
 // --- directory entry serialization ---
