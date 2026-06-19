@@ -5,6 +5,40 @@ import (
 	"testing"
 )
 
+// TestDeferredFree verifies a deferred range stays pinned (cannot be reallocated)
+// until ApplyDeferred, then becomes reusable — the §F1 discipline.
+func TestDeferredFree(t *testing.T) {
+	b := New(8)
+	a, err := b.Alloc(8) // fill the device
+	if err != nil || a != 0 {
+		t.Fatalf("Alloc(8) = %d, %v", a, err)
+	}
+
+	b.Defer(2, 3) // release [2,5) but keep it pinned
+	if b.Pending() != 1 {
+		t.Fatalf("Pending = %d, want 1", b.Pending())
+	}
+	if b.Used() != 8 {
+		t.Fatalf("Used after Defer = %d, want 8 (pinned, still used)", b.Used())
+	}
+	// The pinned run must not be handed out: the device is logically full.
+	if _, err := b.Alloc(1); !errors.Is(err, ErrNoSpace) {
+		t.Fatalf("Alloc over pinned range = %v, want ErrNoSpace", err)
+	}
+
+	b.ApplyDeferred()
+	if b.Pending() != 0 {
+		t.Fatalf("Pending after apply = %d, want 0", b.Pending())
+	}
+	if b.Used() != 5 {
+		t.Fatalf("Used after apply = %d, want 5", b.Used())
+	}
+	got, err := b.Alloc(3) // the released run is now reusable
+	if err != nil || got != 2 {
+		t.Fatalf("Alloc after apply = %d, %v; want start 2", got, err)
+	}
+}
+
 func TestAllocFreeContiguous(t *testing.T) {
 	b := New(64)
 	b.Reserve(0, 5) // superblock + inode table

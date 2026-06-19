@@ -143,9 +143,60 @@ func TestHardlink(t *testing.T) {
 	}
 }
 
+// E7: uncommitted changes vanish after a crash (the "no grey zone" half of fsync
+// durability). The inode table, bitmap and dedup table are one CoW snapshot, and
+// clusters freed during an uncommitted transaction are pinned until commit
+// (deferred-free, §F1) — so neither a newly created inode nor an uncommitted
+// overwrite of committed data leaves a trace on remount.
+func TestUncommittedChangesVanish(t *testing.T) {
+	mem := block.NewMem(4096)
+	f, err := Format(mem, testKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := f.Root()
+
+	// Committed baseline: one file with content "v1".
+	keep, _ := f.Create(root, "keep.txt")
+	if err := f.WriteFile(keep, []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Fsync(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Uncommitted: a brand-new file (its inode + name used to leak via the
+	// in-place inode table) AND an overwrite of the committed file (which frees
+	// the committed extent — without deferred-free the new write would reuse and
+	// clobber it on disk, corrupting the rollback target).
+	ghost, _ := f.Create(root, "ghost.txt")
+	if err := f.WriteFile(keep, []byte("v2-uncommitted")); err != nil {
+		t.Fatal(err)
+	}
+	// No commit here — simulate power loss by remounting the raw device.
+
+	f2, err := Mount(mem, testKey())
+	if err != nil {
+		t.Fatalf("remount: %v", err)
+	}
+	if _, ok, _ := f2.Lookup(f2.Root(), "ghost.txt"); ok {
+		t.Fatal("uncommitted file survived the crash (grey zone)")
+	}
+	if in, err := f2.inodes.Get(ghost); err == nil && in.Nlink != 0 {
+		t.Fatalf("uncommitted inode %d leaked to disk: %+v", ghost, in)
+	}
+	kid, ok, _ := f2.Lookup(f2.Root(), "keep.txt")
+	if !ok {
+		t.Fatal("committed file lost across crash")
+	}
+	if got, _ := f2.ReadFile(kid); !bytes.Equal(got, []byte("v1")) {
+		t.Fatalf("uncommitted overwrite leaked into committed state: %q", got)
+	}
+}
+
 // E7: data committed via Fsync survives a remount (durability of the committed
-// state). Full "uncommitted changes vanish after a crash" requires CoW of the
-// inode table (next task) — see §E.
+// state). Together with TestUncommittedChangesVanish this gives the strong
+// fsync guarantee — committed state durable, uncommitted state gone (§E).
 func TestFsyncDurability(t *testing.T) {
 	mem := block.NewMem(4096)
 	f, err := Format(mem, testKey())

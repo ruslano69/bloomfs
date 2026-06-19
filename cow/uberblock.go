@@ -1,11 +1,12 @@
 // Package cow implements the Copy-on-Write durability layer (§B1, §D-1): the
 // commit root is an "uberblock" stored in two alternating slots. A transaction
-// writes new metadata (allocator bitmap + dedup table) to the inactive metadata
-// slot, then writes a new uberblock — with a higher sequence number and a
-// content checksum — to the inactive uberblock slot. That final block write is
-// the atomic flip. A crash before it leaves the previous uberblock (and the
-// metadata it points to) fully intact, so mount rolls back to the last
-// consistent commit. There is never an in-place overwrite of live data.
+// writes new metadata — the allocator bitmap, the dedup table AND the inode
+// table, as one [bitmap | ddt | inode] snapshot — to the inactive metadata slot,
+// then writes a new uberblock (with a higher sequence number and a content
+// checksum) to the inactive uberblock slot. That final block write is the atomic
+// flip. A crash before it leaves the previous uberblock (and the metadata it
+// points to) fully intact, so mount rolls back to the last consistent commit.
+// There is never an in-place overwrite of live metadata.
 //
 // This supersedes the minimal layout.Superblock (Stage B) as the durable mount
 // path.
@@ -39,6 +40,11 @@ var (
 
 // Uberblock is the self-describing commit root: geometry + which metadata slot
 // holds this commit's snapshot + a checksum that detects a torn write.
+//
+// The active metadata slot is a single CoW snapshot laid out as
+// [bitmap | dedup-table | inode-table], whose three lengths are recorded below.
+// The inode table lives here (not in a fixed in-place region), which is what
+// makes metadata mutations crash-atomic (§B1, §E).
 type Uberblock struct {
 	Magic       uint64
 	Seq         uint64 // commit sequence; highest valid wins
@@ -48,13 +54,13 @@ type Uberblock struct {
 	MetaA       uint64 // first block of metadata slot A
 	MetaB       uint64 // first block of metadata slot B
 	MetaBlocks  uint64 // size of each metadata slot, in blocks
-	InodeTable  uint64
-	InodeCount  uint64
+	InodeCount  uint64 // inode-table capacity (number of slots)
 	DataStart   uint64
 	RootInode   uint64
 	NextInode   uint64 // next free inode id (bump allocator high-water mark)
 	BitmapLen   uint32 // bytes of bitmap snapshot in the active metadata slot
 	DDTLen      uint32 // bytes of dedup-table snapshot, following the bitmap
+	InodeLen    uint32 // bytes of inode-table snapshot, following the dedup table
 }
 
 // MarshalBinary encodes the uberblock into a full block with a trailing checksum.
@@ -68,13 +74,13 @@ func (ub *Uberblock) MarshalBinary() ([]byte, error) {
 	binary.LittleEndian.PutUint64(b[32:], ub.MetaA)
 	binary.LittleEndian.PutUint64(b[40:], ub.MetaB)
 	binary.LittleEndian.PutUint64(b[48:], ub.MetaBlocks)
-	binary.LittleEndian.PutUint64(b[56:], ub.InodeTable)
-	binary.LittleEndian.PutUint64(b[64:], ub.InodeCount)
-	binary.LittleEndian.PutUint64(b[72:], ub.DataStart)
-	binary.LittleEndian.PutUint64(b[80:], ub.RootInode)
+	binary.LittleEndian.PutUint64(b[56:], ub.InodeCount)
+	binary.LittleEndian.PutUint64(b[64:], ub.DataStart)
+	binary.LittleEndian.PutUint64(b[72:], ub.RootInode)
+	binary.LittleEndian.PutUint64(b[80:], ub.NextInode)
 	binary.LittleEndian.PutUint32(b[88:], ub.BitmapLen)
 	binary.LittleEndian.PutUint32(b[92:], ub.DDTLen)
-	binary.LittleEndian.PutUint64(b[96:], ub.NextInode)
+	binary.LittleEndian.PutUint32(b[96:], ub.InodeLen)
 	sum := blake2b.Sum256(b[:uberChecksumOff])
 	copy(b[uberChecksumOff:uberChecksumOff+32], sum[:])
 	return b, nil
@@ -102,13 +108,13 @@ func parseUber(b []byte) (*Uberblock, error) {
 		MetaA:       binary.LittleEndian.Uint64(b[32:]),
 		MetaB:       binary.LittleEndian.Uint64(b[40:]),
 		MetaBlocks:  binary.LittleEndian.Uint64(b[48:]),
-		InodeTable:  binary.LittleEndian.Uint64(b[56:]),
-		InodeCount:  binary.LittleEndian.Uint64(b[64:]),
-		DataStart:   binary.LittleEndian.Uint64(b[72:]),
-		RootInode:   binary.LittleEndian.Uint64(b[80:]),
+		InodeCount:  binary.LittleEndian.Uint64(b[56:]),
+		DataStart:   binary.LittleEndian.Uint64(b[64:]),
+		RootInode:   binary.LittleEndian.Uint64(b[72:]),
+		NextInode:   binary.LittleEndian.Uint64(b[80:]),
 		BitmapLen:   binary.LittleEndian.Uint32(b[88:]),
 		DDTLen:      binary.LittleEndian.Uint32(b[92:]),
-		NextInode:   binary.LittleEndian.Uint64(b[96:]),
+		InodeLen:    binary.LittleEndian.Uint32(b[96:]),
 	}, nil
 }
 

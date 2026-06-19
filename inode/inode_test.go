@@ -11,11 +11,11 @@ func sample() *Inode {
 		Size:           123456,
 		Nlink:          2,
 		Generation:     7,
-		UID:            5,
-		GID:            5,
+		UID:            1000, // > 255: would not survive a u8 field (§4.1)
+		GID:            65534,
 		Type:           TypeRegular,
-		Permissions:    0o64, // packed micro-POSIX (§4.3)
-		RecordSizeLog2: 15,   // 32 KiB recordsize (§4.5)
+		Mode:           0o644, // full POSIX mode bits (> 0o377 needs > u8)
+		RecordSizeLog2: 15,    // 32 KiB recordsize (§4.5)
 		Flags:          FlagCompressed | FlagEncrypted,
 		Atime:          1000,
 		Mtime:          2000,

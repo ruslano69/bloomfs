@@ -63,37 +63,39 @@ type Extent struct {
 
 // Inode is the in-memory metadata record. It never stores the file name (§4.2).
 //
-// On-disk layout (little-endian, 128 bytes):
+// On-disk layout (little-endian, 128 bytes). UID/GID are u32 and Mode is u16 so
+// real POSIX ids (>255) and full permission bits (>0o377) fit — a u8 could hold
+// neither, and widening the on-disk record after images exist would be a format
+// migration, so it is sized correctly up front (§4.1).
 //
 //	0   Size        u64
 //	8   Nlink       u32
 //	12  Generation  u32
-//	16  UID         u8
-//	17  GID         u8
-//	18  Type        u8
-//	19  Permissions u8
-//	20  RecordLog2  u8
-//	21  Flags       u8
-//	22  reserved    [2]
+//	16  UID         u32
+//	20  GID         u32
 //	24  Atime       u64
 //	32  Mtime       u64
 //	40  Ctime       u64
-//	48  Checksum    [8]
-//	56  BlockMap    [64]   inline extents or external pointer
-//	120 padding     [8]
+//	48  Mode        u16   permission/setuid/sticky bits (type is in Type)
+//	50  Type        u8
+//	51  RecordLog2  u8
+//	52  Flags       u8
+//	53  reserved    [3]
+//	56  Checksum    [8]
+//	64  BlockMap    [64]   inline extents or external pointer
 type Inode struct {
 	Size           uint64
 	Nlink          uint32
 	Generation     uint32
-	UID            uint8
-	GID            uint8
-	Type           uint8
-	Permissions    uint8
-	RecordSizeLog2 uint8
-	Flags          uint8
+	UID            uint32
+	GID            uint32
 	Atime          uint64
 	Mtime          uint64
 	Ctime          uint64
+	Mode           uint16
+	Type           uint8
+	RecordSizeLog2 uint8
+	Flags          uint8
 	Checksum       [8]byte
 	BlockMap       [blockMapBytes]byte
 }
@@ -104,19 +106,18 @@ func (in *Inode) MarshalBinary() ([]byte, error) {
 	binary.LittleEndian.PutUint64(b[0:], in.Size)
 	binary.LittleEndian.PutUint32(b[8:], in.Nlink)
 	binary.LittleEndian.PutUint32(b[12:], in.Generation)
-	b[16] = in.UID
-	b[17] = in.GID
-	b[18] = in.Type
-	b[19] = in.Permissions
-	b[20] = in.RecordSizeLog2
-	b[21] = in.Flags
-	// b[22:24] reserved (zero)
+	binary.LittleEndian.PutUint32(b[16:], in.UID)
+	binary.LittleEndian.PutUint32(b[20:], in.GID)
 	binary.LittleEndian.PutUint64(b[24:], in.Atime)
 	binary.LittleEndian.PutUint64(b[32:], in.Mtime)
 	binary.LittleEndian.PutUint64(b[40:], in.Ctime)
-	copy(b[48:56], in.Checksum[:])
-	copy(b[56:120], in.BlockMap[:])
-	// b[120:128] padding (zero)
+	binary.LittleEndian.PutUint16(b[48:], in.Mode)
+	b[50] = in.Type
+	b[51] = in.RecordSizeLog2
+	b[52] = in.Flags
+	// b[53:56] reserved (zero)
+	copy(b[56:64], in.Checksum[:])
+	copy(b[64:128], in.BlockMap[:])
 	return b, nil
 }
 
@@ -128,17 +129,17 @@ func (in *Inode) UnmarshalBinary(b []byte) error {
 	in.Size = binary.LittleEndian.Uint64(b[0:])
 	in.Nlink = binary.LittleEndian.Uint32(b[8:])
 	in.Generation = binary.LittleEndian.Uint32(b[12:])
-	in.UID = b[16]
-	in.GID = b[17]
-	in.Type = b[18]
-	in.Permissions = b[19]
-	in.RecordSizeLog2 = b[20]
-	in.Flags = b[21]
+	in.UID = binary.LittleEndian.Uint32(b[16:])
+	in.GID = binary.LittleEndian.Uint32(b[20:])
 	in.Atime = binary.LittleEndian.Uint64(b[24:])
 	in.Mtime = binary.LittleEndian.Uint64(b[32:])
 	in.Ctime = binary.LittleEndian.Uint64(b[40:])
-	copy(in.Checksum[:], b[48:56])
-	copy(in.BlockMap[:], b[56:120])
+	in.Mode = binary.LittleEndian.Uint16(b[48:])
+	in.Type = b[50]
+	in.RecordSizeLog2 = b[51]
+	in.Flags = b[52]
+	copy(in.Checksum[:], b[56:64])
+	copy(in.BlockMap[:], b[64:128])
 	return nil
 }
 

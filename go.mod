@@ -3,6 +3,7 @@ module github.com/ruslano69/bloomfs
 go 1.26.4
 
 require (
+	github.com/hanwen/go-fuse/v2 v2.10.1
 	github.com/klauspost/compress v1.18.0
 	github.com/ruslano69/xxh3-bloom v0.8.0
 	github.com/zeebo/xxh3 v1.1.0

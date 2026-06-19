@@ -17,11 +17,23 @@ var (
 )
 
 // Bitmap tracks which clusters are used.
+//
+// deferred holds clusters freed during the current (uncommitted) transaction.
+// Their bits stay SET so they cannot be reallocated and overwrite data the last
+// commit still references; the durability layer applies them (ApplyDeferred)
+// only after a commit's uberblock flip, so they become reusable one commit
+// later. This is the deferred-free / pinned-extent discipline of ZFS/Btrfs and
+// is what keeps "no grey zone" true for overwrite-then-crash (§B2, §E, §F1).
+// It is transient RAM state: a fresh Mount starts with none pending.
 type Bitmap struct {
-	bits  []uint64
-	total uint64
-	used  uint64
+	bits     []uint64
+	total    uint64
+	used     uint64
+	deferred []freeRange
 }
+
+// freeRange is a contiguous run pending deferred free.
+type freeRange struct{ start, count uint64 }
 
 // New returns a bitmap for total clusters, all free.
 func New(total uint64) *Bitmap {
@@ -70,7 +82,10 @@ func (b *Bitmap) Alloc(count uint64) (uint64, error) {
 	return 0, ErrNoSpace
 }
 
-// Free marks [start, start+count) free.
+// Free marks [start, start+count) free immediately. Use this only for clusters
+// allocated within the current transaction that were never committed (e.g. the
+// rollback of a failed Write) — reusing them at once is safe. For releasing
+// clusters that may belong to a committed state, use Defer.
 func (b *Bitmap) Free(start, count uint64) {
 	for i := start; i < start+count && i < b.total; i++ {
 		if b.get(i) {
@@ -79,6 +94,28 @@ func (b *Bitmap) Free(start, count uint64) {
 		}
 	}
 }
+
+// Defer records [start, start+count) for release at the next commit, leaving the
+// bits SET so the run cannot be reallocated before then (§F1). The clusters keep
+// counting as used until ApplyDeferred runs.
+func (b *Bitmap) Defer(start, count uint64) {
+	b.deferred = append(b.deferred, freeRange{start, count})
+}
+
+// ApplyDeferred actually frees every range recorded by Defer and clears the
+// pending list. The durability layer calls this after a commit's uberblock flip
+// succeeds, so the just-committed snapshot still marks these clusters used (they
+// are reclaimed one commit later) while a crash before the flip leaves them
+// pinned — never reused, never lost.
+func (b *Bitmap) ApplyDeferred() {
+	for _, r := range b.deferred {
+		b.Free(r.start, r.count)
+	}
+	b.deferred = b.deferred[:0]
+}
+
+// Pending reports how many deferred-free ranges await ApplyDeferred.
+func (b *Bitmap) Pending() int { return len(b.deferred) }
 
 func (b *Bitmap) Used() uint64      { return b.used }
 func (b *Bitmap) Available() uint64 { return b.total - b.used }

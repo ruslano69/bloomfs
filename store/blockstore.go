@@ -173,10 +173,13 @@ func (s *BlockStore) Read(r Ref) ([]byte, error) {
 }
 
 // Release drops one reference to a block; the last reference frees its clusters
-// (§5.4). In production this hands off to the GC worker (§B5).
+// (§5.4). The free is deferred until the next commit (§F1): the clusters may
+// belong to the last committed state, so reusing them before this transaction
+// commits could overwrite data a crash would need to roll back to. In production
+// this also hands off to the GC worker (§B5).
 func (s *BlockStore) Release(r Ref) {
 	if e, freed := s.ddt.Decr(r.Hash); freed {
-		s.alloc.Free(e.Start, uint64(e.Count))
+		s.alloc.Defer(e.Start, uint64(e.Count))
 	}
 }
 
