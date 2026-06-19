@@ -3,6 +3,7 @@ package fs
 import (
 	"encoding/binary"
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/ruslano69/bloomfs/block"
@@ -14,7 +15,27 @@ import (
 // not exhaust the bitmap between periodic commits.
 func benchFS(b *testing.B, files int) (*FS, uint64, []string, []uint64) {
 	b.Helper()
-	f, err := Format(block.NewMem(16384), testKey()) // 64 MiB pool
+	return benchFSOn(b, block.NewMem(16384), files) // 64 MiB pool
+}
+
+// benchFSFile is benchFS backed by a real file image, so a Commit pays a true
+// fsync (MemDevice.Sync is a no-op). Point TMPDIR at the medium under test
+// (tmpfs vs. a real SSD/NVMe) to compare commit cost across storage.
+func benchFSFile(b *testing.B, files int) (*FS, uint64, []string, []uint64) {
+	b.Helper()
+	dev, err := block.Create(filepath.Join(b.TempDir(), "disk.img"), 16384)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { dev.Close() })
+	return benchFSOn(b, dev, files)
+}
+
+// benchFSOn formats dev and fills the root with `files` empty files, shared by
+// the in-memory and file-image variants above.
+func benchFSOn(b *testing.B, dev block.Device, files int) (*FS, uint64, []string, []uint64) {
+	b.Helper()
+	f, err := Format(dev, testKey())
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -111,12 +132,12 @@ func BenchmarkParallelLookupHit(b *testing.B) {
 }
 
 // BenchmarkCreateUnlink measures one metadata-churn cycle (create + unlink) in a
-// directory already holding ~4000 entries. Each call re-serializes the whole
-// directory blob through the dedup/compress/encrypt pipeline, so this surfaces
-// the O(dir size) write amplification of the current whole-directory-rewrite
-// design (the main candidate for the next optimization). Commits run every batch
-// to reclaim deferred-freed clusters, with the timer paused so commit cost does
-// not pollute the per-op number.
+// directory already holding ~4000 entries. Since the page-aligned directory
+// layout + deferred Bloom-filter rebuild, each cycle rewrites only the one
+// touched 4 KiB page and skips the filter rebuild, so this is the per-op CPU
+// cost of the mutation itself. Commits run every batch to reclaim deferred-freed
+// clusters, with the timer paused so commit cost does not pollute the per-op
+// number (see BenchmarkCreateUnlinkCommit for the commit-inclusive figure).
 func BenchmarkCreateUnlink(b *testing.B) {
 	f, root, _, _ := benchFS(b, 4000)
 	const name = "churn.tmp"
@@ -211,4 +232,42 @@ func BenchmarkWriteFileDedupHit(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// commitCycle times one durable metadata transaction: a create+unlink followed
+// by a Commit, with the Commit INSIDE the timed region (unlike BenchmarkCreateUnlink,
+// which pauses the timer around the commit). On a MemDevice the commit is the
+// CoW snapshot serialization only; on a FileDevice it also pays a real fsync, so
+// the mem-vs-file delta isolates the cost of durability on the target medium.
+func commitCycle(b *testing.B, f *FS, root uint64) {
+	b.Helper()
+	const name = "churn.tmp"
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.Create(root, name); err != nil {
+			b.Fatal(err)
+		}
+		if err := f.Unlink(root, name); err != nil {
+			b.Fatal(err)
+		}
+		if err := f.Commit(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkCreateUnlinkCommit is the in-memory baseline: one create+unlink+commit
+// per op with no real fsync (MemDevice.Sync is a no-op), so it measures the CoW
+// snapshot cost alone.
+func BenchmarkCreateUnlinkCommit(b *testing.B) {
+	f, root, _, _ := benchFS(b, 4000)
+	commitCycle(b, f, root)
+}
+
+// BenchmarkCreateUnlinkCommitFile is the file-image counterpart: identical work
+// but the per-op Commit fsyncs a real image. Subtract the mem figure to read off
+// the fsync/durability tax of the storage TMPDIR points at.
+func BenchmarkCreateUnlinkCommitFile(b *testing.B) {
+	f, root, _, _ := benchFSFile(b, 4000)
+	commitCycle(b, f, root)
 }
