@@ -6,6 +6,7 @@ import (
 
 	"github.com/ruslano69/bloomfs/alloc"
 	"github.com/ruslano69/bloomfs/block"
+	"github.com/ruslano69/bloomfs/dedup"
 	"github.com/ruslano69/bloomfs/layout"
 )
 
@@ -24,7 +25,7 @@ func newStore(t *testing.T) (*BlockStore, block.Device) {
 	for i := range key {
 		key[i] = byte(i + 1)
 	}
-	bs, err := New(dev, a, key)
+	bs, err := New(dev, a, dedup.New(), key)
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}

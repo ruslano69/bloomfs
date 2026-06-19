@@ -55,6 +55,7 @@ func Format(dev block.Device, inodeCount, ddtReserve uint64) (*Uberblock, error)
 		InodeCount:  inodeBlocks * inode.PerBlock,
 		DataStart:   dataStart,
 		RootInode:   0,
+		NextInode:   1, // inode 0 is the root directory
 	}
 
 	zero := make([]byte, block.Size)
@@ -115,11 +116,12 @@ func Mount(dev block.Device) (*Uberblock, *alloc.Bitmap, *dedup.Table, error) {
 // Commit atomically records a new consistent state: it snapshots bm+ddt into the
 // inactive metadata slot (synced), then flips the uberblock (synced). On any
 // failure the previous commit remains valid; remounting rolls back to it.
-func Commit(dev block.Device, prev *Uberblock, bm *alloc.Bitmap, ddt *dedup.Table, rootInode uint64) (*Uberblock, error) {
+func Commit(dev block.Device, prev *Uberblock, bm *alloc.Bitmap, ddt *dedup.Table, rootInode, nextInode uint64) (*Uberblock, error) {
 	next := *prev // inherit geometry
 	next.Seq = prev.Seq + 1
 	next.ActiveMeta = 1 - prev.ActiveMeta // alternate metadata slot
 	next.RootInode = rootInode
+	next.NextInode = nextInode
 
 	if err := writeSnapshot(dev, &next, bm, ddt); err != nil {
 		return nil, err

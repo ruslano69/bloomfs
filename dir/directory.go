@@ -102,3 +102,22 @@ func (d *Directory) List() []string {
 	}
 	return names
 }
+
+// Entry is a name → inode pair, used for serializing a directory's contents.
+type Entry struct {
+	Name  string
+	Inode InodeID
+}
+
+// Entries returns every (name, inode) pair. Order is unspecified.
+func (d *Directory) Entries() []Entry {
+	out := make([]Entry, 0, d.Len())
+	for _, s := range d.segments {
+		for _, chain := range s.index {
+			for _, e := range chain {
+				out = append(out, Entry{Name: e.name, Inode: e.inode})
+			}
+		}
+	}
+	return out
+}

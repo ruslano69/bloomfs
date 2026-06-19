@@ -25,7 +25,7 @@ const (
 	// uberMagic identifies an uberblock (a fixed, arbitrary 64-bit tag).
 	uberMagic = 0xB100F5_C0FFEE_01
 	// uberChecksumOff is where the BLAKE2b checksum of the preceding bytes lives.
-	uberChecksumOff = 96
+	uberChecksumOff = 104
 	// UberSlot0 / UberSlot1 are the two ping-pong uberblock blocks.
 	UberSlot0 = 0
 	UberSlot1 = 1
@@ -52,6 +52,7 @@ type Uberblock struct {
 	InodeCount  uint64
 	DataStart   uint64
 	RootInode   uint64
+	NextInode   uint64 // next free inode id (bump allocator high-water mark)
 	BitmapLen   uint32 // bytes of bitmap snapshot in the active metadata slot
 	DDTLen      uint32 // bytes of dedup-table snapshot, following the bitmap
 }
@@ -73,6 +74,7 @@ func (ub *Uberblock) MarshalBinary() ([]byte, error) {
 	binary.LittleEndian.PutUint64(b[80:], ub.RootInode)
 	binary.LittleEndian.PutUint32(b[88:], ub.BitmapLen)
 	binary.LittleEndian.PutUint32(b[92:], ub.DDTLen)
+	binary.LittleEndian.PutUint64(b[96:], ub.NextInode)
 	sum := blake2b.Sum256(b[:uberChecksumOff])
 	copy(b[uberChecksumOff:uberChecksumOff+32], sum[:])
 	return b, nil
@@ -106,6 +108,7 @@ func parseUber(b []byte) (*Uberblock, error) {
 		RootInode:   binary.LittleEndian.Uint64(b[80:]),
 		BitmapLen:   binary.LittleEndian.Uint32(b[88:]),
 		DDTLen:      binary.LittleEndian.Uint32(b[92:]),
+		NextInode:   binary.LittleEndian.Uint64(b[96:]),
 	}, nil
 }
 

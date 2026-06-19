@@ -50,12 +50,17 @@ type BlockStore struct {
 	dec   *zstd.Decoder
 }
 
-// New builds a BlockStore. key must be a valid AES-XTS key (32 bytes for
+// New builds a BlockStore sharing the caller's allocator and dedup table (so the
+// durability layer can snapshot them, §B3). A nil key selects a plaintext pool
+// (§5.5 opt-out); otherwise key must be a valid AES-XTS key (32 bytes for
 // AES-128-XTS or 64 for AES-256-XTS). Key management (keyring/Argon2id) is §B4.
-func New(dev block.Device, a *alloc.Bitmap, key []byte) (*BlockStore, error) {
-	x, err := xts.NewCipher(aes.NewCipher, key)
-	if err != nil {
-		return nil, fmt.Errorf("store: xts cipher: %w", err)
+func New(dev block.Device, a *alloc.Bitmap, ddt *dedup.Table, key []byte) (*BlockStore, error) {
+	var x *xts.Cipher
+	if key != nil {
+		var err error
+		if x, err = xts.NewCipher(aes.NewCipher, key); err != nil {
+			return nil, fmt.Errorf("store: xts cipher: %w", err)
+		}
 	}
 	enc, err := zstd.NewWriter(nil)
 	if err != nil {
@@ -65,7 +70,7 @@ func New(dev block.Device, a *alloc.Bitmap, key []byte) (*BlockStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: zstd decoder: %w", err)
 	}
-	return &BlockStore{dev: dev, alloc: a, ddt: dedup.New(), xts: x, enc: enc, dec: dec}, nil
+	return &BlockStore{dev: dev, alloc: a, ddt: ddt, xts: x, enc: enc, dec: dec}, nil
 }
 
 // Close releases the compressor/decompressor resources.
@@ -111,7 +116,9 @@ func (s *BlockStore) Write(plaintext []byte) (Ref, error) {
 	copy(buf, payload)
 	for i := uint64(0); i < count; i++ {
 		sec := buf[i*block.Size : (i+1)*block.Size]
-		s.xts.Encrypt(sec, sec, start+i)
+		if s.xts != nil {
+			s.xts.Encrypt(sec, sec, start+i)
+		}
 		if err := s.dev.WriteBlock(start+i, sec); err != nil {
 			s.alloc.Free(start, count)
 			return Ref{}, err
@@ -137,7 +144,9 @@ func (s *BlockStore) Read(r Ref) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		s.xts.Decrypt(blk, blk, r.Start+i)
+		if s.xts != nil {
+			s.xts.Decrypt(blk, blk, r.Start+i)
+		}
 		copy(buf[i*block.Size:], blk)
 	}
 	payload := buf[:r.Payload]

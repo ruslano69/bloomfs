@@ -27,6 +27,7 @@ filesystems like ZFS; the Bloom-segmented lookup is what BloomFS adds.
 | Dedup | `dedup` | Content-hash table with reference counts |
 | Data pipeline | `store` | hash → dedup → ZSTD → AES-XTS → write |
 | Durability | `cow` | Copy-on-Write commits with crash recovery |
+| Filesystem (VFS) | `fs` | Ties it all together: Mkdir/Create/Read/Write/Readdir/Unlink/Commit |
 
 ## Implementation status
 
@@ -34,7 +35,10 @@ filesystems like ZFS; the Bloom-segmented lookup is what BloomFS adds.
 - [x] **Stage B** — block device (memory + file image) + inode serialization + superblock
 - [x] **Stage C** — allocator + dedup + compress/encrypt data pipeline
 - [x] **Stage D** — Copy-on-Write transactions + crash recovery
-- [ ] **Stage E** — FUSE mount, permissions, page cache, quotas
+- [x] **VFS integration** — `dir`+`inode`+`store`+`cow` as one persistent
+  filesystem (`fs` package); end-to-end build → commit → remount → read back,
+  tested without a kernel mount
+- [ ] **Stage E** — FUSE/WinFsp binding + permissions + page cache + quotas
 - [ ] **Stage F** — Rust port (and real BLAKE3, see notes)
 
 ## Design pipeline (data path)
