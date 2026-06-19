@@ -58,8 +58,9 @@ doubles as an end-to-end integrity check on read.
   number and a checksum. A commit writes the metadata snapshot, then flips the
   uberblock; a torn write is rejected by the checksum and mount rolls back to the
   last consistent commit.
-- The full design specification (Russian) lives outside this repo and drives the
-  staged implementation.
+- The full design specification (Russian) is in [docs/SPEC.md](docs/SPEC.md) and
+  drives the staged implementation — including the resolved decisions on
+  Copy-on-Write, deduplication, recordsize, and compression/encryption modes.
 
 ## Build & test
 
