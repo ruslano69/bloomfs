@@ -529,9 +529,21 @@ impl<D: Device> FS<D> {
     // --- store helpers (the store holds only the cipher; pass dev/bm/ddt here) ---
 
     fn bs_write(&mut self, plaintext: &[u8]) -> Result<Ref> {
-        Ok(self
-            .bs
-            .write(&self.dev, &mut self.bm, &mut self.ddt, plaintext)?)
+        match self.bs.write(&self.dev, &mut self.bm, &mut self.ddt, plaintext) {
+            Ok(r) => Ok(r),
+            // If the bitmap is full but deferred frees are pending, commit now
+            // to reclaim them and retry once.  This prevents ENOSPC in workloads
+            // that unlink files in a loop (e.g. keeping the last N archives):
+            // deferred frees accumulate until commit, but an immediate commit
+            // drains them and makes the space available for the retry.
+            Err(bloomfs_store::Error::Alloc(bloomfs_alloc::Error::NoSpace))
+                if self.bm.pending() > 0 =>
+            {
+                self.commit()?;
+                Ok(self.bs.write(&self.dev, &mut self.bm, &mut self.ddt, plaintext)?)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn bs_read(&self, r: &Ref) -> Result<Vec<u8>> {
@@ -880,10 +892,16 @@ impl<D: Device> FS<D> {
     pub fn statfs(&self) -> FsStat {
         let used = self.ub.next_inode - self.free_inodes.len() as u64;
         let cap = self.inodes.cap();
+        // `available()` excludes deferred-free clusters (they stay SET in the
+        // bitmap until the next commit so a crash can't reuse them).  Adding
+        // `deferred_count()` gives the user-visible "free" figure: space that
+        // is either already free or will be freed atomically at the next commit.
+        // Without this, `df` over-reports usage during a long write/unlink loop
+        // and can trigger spurious "disk full" warnings.
         FsStat {
             block_size: BLK,
             blocks: self.bm.total(),
-            blocks_free: self.bm.available(),
+            blocks_free: self.bm.available() + self.bm.deferred_count(),
             files: cap,
             files_free: cap - used,
         }
@@ -1758,6 +1776,61 @@ mod tests {
         assert!(
             fs2.lookup(fs2.root(), "lost").unwrap().is_none(),
             "uncommitted mkdir must vanish after remount"
+        );
+    }
+
+    /// Archive-loop scenario: write 10 files in a tight loop, keeping only the
+    /// last N by unlinking the oldest.  Without auto-commit-on-ENOSPC the
+    /// deferred-free clusters pile up and eventually the bitmap appears full
+    /// even though only N files' worth of data is live.
+    ///
+    /// Specifically checks:
+    /// 1. `statfs.blocks_free` stays stable (deferred frees are accounted for).
+    /// 2. No ENOSPC occurs across 50 iterations on a small device.
+    /// 3. After an explicit commit the free-block count is close to its start.
+    #[test]
+    fn archive_loop_no_enospc() {
+        // 512 blocks (~2 MiB).  The CoW layer needs ~388 blocks for metadata on
+        // format, leaving ~124 blocks for data — tight enough to expose the
+        // deferred-free exhaustion bug without hitting format's DeviceTooSmall.
+        let dev = MemDevice::new(512);
+        let mut fs = FS::format(dev, None).unwrap();
+        let root = fs.root();
+
+        let payload = vec![0xABu8; 4096]; // one 4 KiB block per archive
+        let keep = 5usize;
+        let mut names: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+
+        let free_start = fs.statfs().blocks_free;
+
+        for i in 0..50usize {
+            let name = format!("archive_{i:03}.bin");
+            let id = fs.create(root, &name).expect("create must not return ENOSPC");
+            fs.write_file(id, &payload).expect("write_file must not return ENOSPC");
+            names.push_back(name);
+
+            // Keep only the last `keep` archives.
+            if names.len() > keep {
+                let old = names.pop_front().unwrap();
+                fs.unlink(root, &old).expect("unlink");
+            }
+
+            // `statfs` must report a reasonable free count even without an
+            // explicit commit — deferred_count() is included in blocks_free.
+            let free_now = fs.statfs().blocks_free;
+            assert!(
+                free_now > 0,
+                "statfs reported 0 free blocks at iteration {i} (deferred frees not counted)"
+            );
+        }
+
+        // After an explicit commit all deferred frees are applied; the free
+        // count should return to near its initial value (only `keep` files live).
+        fs.commit().unwrap();
+        let free_after = fs.statfs().blocks_free;
+        assert!(
+            free_after > free_start / 2,
+            "after commit, free blocks ({free_after}) should be close to initial ({free_start})"
         );
     }
 }

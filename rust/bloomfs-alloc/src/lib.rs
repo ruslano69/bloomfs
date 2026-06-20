@@ -168,6 +168,17 @@ impl Bitmap {
         self.deferred.len()
     }
 
+    /// Total number of clusters queued in deferred-free ranges.
+    ///
+    /// These clusters are still counted as *used* in the bitmap (they cannot be
+    /// reallocated until after the next commit), but from the user's perspective
+    /// they are "about to be free" — `statfs` should add this to `available()`
+    /// so that `df` does not falsely report the filesystem as nearly full during
+    /// a long write or unlink loop.
+    pub fn deferred_count(&self) -> u64 {
+        self.deferred.iter().map(|r| r.count).sum()
+    }
+
     /// Number of clusters currently marked used.
     pub fn used(&self) -> u64 {
         self.used
