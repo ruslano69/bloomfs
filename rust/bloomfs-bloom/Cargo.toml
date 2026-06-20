@@ -1,0 +1,10 @@
+[package]
+name = "bloomfs-bloom"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "BloomFS scalar blocked Bloom filter (critical path): one cache line per key, XXH3-keyed, math-parity with the Go xxh3-bloom library."
+
+[dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["bloomfs-block", "bloomfs-alloc", "bloomfs-inode", "bloomfs-dedup"]
+members = ["bloomfs-block", "bloomfs-alloc", "bloomfs-inode", "bloomfs-dedup", "bloomfs-bloom"]
 
 [workspace.package]
 edition = "2021"
