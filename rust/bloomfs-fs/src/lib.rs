@@ -854,6 +854,32 @@ impl<D: Device> FS<D> {
         Ok(out)
     }
 
+    /// Whether `target` lies anywhere in the directory subtree rooted at `root`
+    /// (inclusive). `rename` uses this to reject moving a directory into one of
+    /// its own descendants — that would splice the subtree out of the namespace,
+    /// leaking every inode and block it holds forever (POSIX requires `EINVAL`).
+    ///
+    /// BloomFS stores no parent back-pointer, so we cannot walk *up* from
+    /// `target`; instead we walk *down* from `root` (iterative DFS over an
+    /// explicit stack to avoid blowing the call stack on deep trees). Only
+    /// directory entries are pushed, so the traversal is bounded by the number of
+    /// directories under `root`, not the total file count.
+    fn dir_subtree_contains(&self, root: u64, target: u64) -> Result<bool> {
+        let mut stack = vec![root];
+        while let Some(d) = stack.pop() {
+            if d == target {
+                return Ok(true);
+            }
+            for e in self.read_dir_pages(d)? {
+                // Recurse only into directories — files have no children.
+                if self.inodes.get(e.inode.0)?.kind == TYPE_DIR {
+                    stack.push(e.inode.0);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     // --- VFS operations ---
 
     /// Resolve `name` in directory `parent` to an inode id.
@@ -1441,6 +1467,19 @@ impl<D: Device> FS<D> {
         if dst_parent == id.0 {
             return Err(Error::Invalid);
         }
+        // Reject the deeper loop: moving a directory into one of its own
+        // descendants (e.g. `mv /a /a/b/c`).  That would detach the subtree from
+        // the root — unreachable, un-rmdir-able, and a permanent inode/block leak
+        // (POSIX EINVAL).  Only a directory can form such a cycle, so the
+        // (potentially costly) subtree walk is skipped for files/symlinks.  The
+        // walk runs only when src and dst parents differ; within one directory a
+        // rename can never change ancestry.
+        if src_parent != dst_parent
+            && self.inodes.get(id.0)?.kind == TYPE_DIR
+            && self.dir_subtree_contains(id.0, dst_parent)?
+        {
+            return Err(Error::Invalid);
+        }
 
         if src_parent == dst_parent {
             // Same directory: both edits land on the one handle, one flush.
@@ -1713,6 +1752,38 @@ mod tests {
         assert_eq!(fs.lookup(root, "c").unwrap(), None);
         assert_eq!(fs.lookup(d, "moved").unwrap(), Some(f));
         assert_eq!(fs.read_file(f).unwrap(), b"x");
+    }
+
+    /// Moving a directory into its own descendant must fail with EINVAL — it
+    /// would otherwise detach the subtree and leak its inodes/blocks forever.
+    #[test]
+    fn rename_into_own_descendant_rejected() {
+        let mut fs = fresh();
+        let root = fs.root();
+        // Build /a/b/c
+        let a = fs.mkdir(root, "a").unwrap();
+        let b = fs.mkdir(a, "b").unwrap();
+        let c = fs.mkdir(b, "c").unwrap();
+
+        // mv /a -> /a/b/c/a  (a into its own grandchild) must be EINVAL.
+        assert!(
+            matches!(fs.rename(root, "a", c, "a"), Err(Error::Invalid)),
+            "moving a directory into its own descendant must return Invalid"
+        );
+
+        // Direct child case: mv /a -> /a/b/a is also a loop.
+        assert!(
+            matches!(fs.rename(root, "a", b, "a"), Err(Error::Invalid)),
+            "moving a directory into its own child must return Invalid"
+        );
+
+        // Sanity: a legitimate cross-dir move of `a` into a SIBLING still works.
+        let sib = fs.mkdir(root, "sib").unwrap();
+        fs.rename(root, "a", sib, "a").unwrap();
+        assert_eq!(fs.lookup(sib, "a").unwrap(), Some(a));
+        // And the subtree survived intact.
+        assert_eq!(fs.lookup(a, "b").unwrap(), Some(b));
+        assert_eq!(fs.lookup(b, "c").unwrap(), Some(c));
     }
 
     #[test]
