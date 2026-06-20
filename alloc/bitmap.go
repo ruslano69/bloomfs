@@ -121,13 +121,23 @@ func (b *Bitmap) Used() uint64      { return b.used }
 func (b *Bitmap) Available() uint64 { return b.total - b.used }
 func (b *Bitmap) Total() uint64     { return b.total }
 
+// MarshalLen reports how many bytes Marshal/MarshalInto will write.
+func (b *Bitmap) MarshalLen() int { return 8 + len(b.bits)*8 }
+
+// MarshalInto serializes the bitmap into dst (at least MarshalLen bytes) and
+// returns the number of bytes written, allocating nothing.
+func (b *Bitmap) MarshalInto(dst []byte) int {
+	binary.LittleEndian.PutUint64(dst, b.total)
+	for i, w := range b.bits {
+		binary.LittleEndian.PutUint64(dst[8+i*8:], w)
+	}
+	return 8 + len(b.bits)*8
+}
+
 // Marshal serializes the bitmap (total header + raw words).
 func (b *Bitmap) Marshal() []byte {
-	out := make([]byte, 8+len(b.bits)*8)
-	binary.LittleEndian.PutUint64(out, b.total)
-	for i, w := range b.bits {
-		binary.LittleEndian.PutUint64(out[8+i*8:], w)
-	}
+	out := make([]byte, b.MarshalLen())
+	b.MarshalInto(out)
 	return out
 }
 

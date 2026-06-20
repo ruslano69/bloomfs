@@ -56,14 +56,25 @@ func (t *Table) Put(id uint64, in *Inode) error {
 	return nil
 }
 
+// MarshalLen reports how many bytes Marshal/MarshalInto will write: the leading
+// count slots at Size bytes each.
+func (t *Table) MarshalLen() int { return int(t.count * Size) }
+
+// MarshalInto serializes slots [0, count) into dst (which must be at least
+// MarshalLen bytes) and returns the number of bytes written. It allocates
+// nothing — the commit path reuses one buffer across snapshots.
+func (t *Table) MarshalInto(dst []byte) int {
+	for i := uint64(0); i < t.count; i++ {
+		t.inodes[i].marshalInto(dst[i*Size : (i+1)*Size])
+	}
+	return int(t.count * Size)
+}
+
 // Marshal serializes slots [0, count) as count*Size bytes (the explicit on-disk
 // inode encoding, §B15). The snapshot lands in the CoW metadata slot.
 func (t *Table) Marshal() []byte {
-	buf := make([]byte, t.count*Size)
-	for i := uint64(0); i < t.count; i++ {
-		enc, _ := t.inodes[i].MarshalBinary() // MarshalBinary never errors
-		copy(buf[i*Size:], enc)
-	}
+	buf := make([]byte, t.MarshalLen())
+	t.MarshalInto(buf)
 	return buf
 }
 

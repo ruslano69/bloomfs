@@ -12,30 +12,42 @@ var ErrShort = errors.New("dedup: serialized table too short")
 // Payload(4) + Logical(4) + Raw(1) + Refs(4).
 const recSize = 32 + 8 + 4 + 4 + 4 + 1 + 4
 
-// Marshal serializes the table (count header + fixed-size records). Iteration
-// order is unspecified — the table is a set, so order does not matter.
-func (t *Table) Marshal() []byte {
-	out := make([]byte, 8+len(t.m)*recSize)
-	binary.LittleEndian.PutUint64(out, uint64(len(t.m)))
+// MarshalLen reports how many bytes Marshal/MarshalInto will write.
+func (t *Table) MarshalLen() int { return 8 + len(t.m)*recSize }
+
+// MarshalInto serializes the table into dst (at least MarshalLen bytes) and
+// returns the number of bytes written, allocating nothing. Iteration order is
+// unspecified — the table is a set, so order does not matter.
+func (t *Table) MarshalInto(dst []byte) int {
+	binary.LittleEndian.PutUint64(dst, uint64(len(t.m)))
 	off := 8
 	for k, e := range t.m {
-		copy(out[off:], k[:])
+		copy(dst[off:], k[:])
 		off += 32
-		binary.LittleEndian.PutUint64(out[off:], e.Start)
+		binary.LittleEndian.PutUint64(dst[off:], e.Start)
 		off += 8
-		binary.LittleEndian.PutUint32(out[off:], e.Count)
+		binary.LittleEndian.PutUint32(dst[off:], e.Count)
 		off += 4
-		binary.LittleEndian.PutUint32(out[off:], e.Payload)
+		binary.LittleEndian.PutUint32(dst[off:], e.Payload)
 		off += 4
-		binary.LittleEndian.PutUint32(out[off:], e.Logical)
+		binary.LittleEndian.PutUint32(dst[off:], e.Logical)
 		off += 4
 		if e.Raw {
-			out[off] = 1
+			dst[off] = 1
+		} else {
+			dst[off] = 0
 		}
 		off++
-		binary.LittleEndian.PutUint32(out[off:], e.Refs)
+		binary.LittleEndian.PutUint32(dst[off:], e.Refs)
 		off += 4
 	}
+	return off
+}
+
+// Marshal serializes the table (count header + fixed-size records).
+func (t *Table) Marshal() []byte {
+	out := make([]byte, t.MarshalLen())
+	t.MarshalInto(out)
 	return out
 }
 

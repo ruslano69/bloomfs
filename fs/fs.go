@@ -96,6 +96,11 @@ type FS struct {
 	// clock returns the current time in Unix nanoseconds; it stamps a/m/ctime on
 	// mutations (§F6). A field (not a global) so tests can drive it deterministically.
 	clock func() uint64
+
+	// metaBuf is the reusable serialization buffer for the CoW metadata snapshot,
+	// sized to one metadata slot and reused across commits so a commit allocates
+	// nothing (it is only ever touched under the write lock during commitLocked).
+	metaBuf []byte
 }
 
 // dirPageSize is the directory persistence unit: one entry list is split across
@@ -222,6 +227,7 @@ func Mount(dev block.Device, key []byte) (*FS, error) {
 		openCount:  make(map[uint64]uint32),
 		freeInodes: rebuildFreeInodes(inodes),
 		clock:      func() uint64 { return uint64(time.Now().UnixNano()) },
+		metaBuf:    make([]byte, ub.MetaBlocks*block.Size),
 	}, nil
 }
 
@@ -269,7 +275,7 @@ func (f *FS) Commit() error {
 
 // commitLocked performs the commit assuming the write lock is held.
 func (f *FS) commitLocked() error {
-	ub, err := cow.Commit(f.dev, f.ub, f.bm, f.ddt, f.inodes, f.ub.RootInode, f.ub.NextInode)
+	ub, err := cow.Commit(f.dev, f.ub, f.bm, f.ddt, f.inodes, f.ub.RootInode, f.ub.NextInode, f.metaBuf)
 	if err != nil {
 		return err
 	}

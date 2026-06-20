@@ -103,6 +103,14 @@ type Inode struct {
 // MarshalBinary encodes the inode to exactly Size bytes.
 func (in *Inode) MarshalBinary() ([]byte, error) {
 	b := make([]byte, Size)
+	in.marshalInto(b)
+	return b, nil
+}
+
+// marshalInto writes the inode's Size-byte encoding into b[:Size]. The caller
+// owns b (it must be at least Size bytes), so the hot commit path can serialize
+// the whole table into one reusable buffer with no per-inode allocation.
+func (in *Inode) marshalInto(b []byte) {
 	binary.LittleEndian.PutUint64(b[0:], in.Size)
 	binary.LittleEndian.PutUint32(b[8:], in.Nlink)
 	binary.LittleEndian.PutUint32(b[12:], in.Generation)
@@ -115,10 +123,9 @@ func (in *Inode) MarshalBinary() ([]byte, error) {
 	b[50] = in.Type
 	b[51] = in.RecordSizeLog2
 	b[52] = in.Flags
-	// b[53:56] reserved (zero)
+	b[53], b[54], b[55] = 0, 0, 0 // reserved — written explicitly so a reused buffer carries no stale bytes
 	copy(b[56:64], in.Checksum[:])
 	copy(b[64:128], in.BlockMap[:])
-	return b, nil
 }
 
 // UnmarshalBinary decodes exactly Size bytes into the receiver.

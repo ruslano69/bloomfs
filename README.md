@@ -112,6 +112,11 @@ filesystems like ZFS; the Bloom-segmented lookup is what BloomFS adds.
   per-segment Bloom filter is rebuilt lazily (amortized, on accumulated
   removals) instead of on every unlink. `BenchmarkCreateUnlink` on a 4000-entry
   directory dropped ~35× (5.99 ms → 170 µs/op) with lookup latency unchanged.
+- [x] **Zero-alloc metadata commit** — `cow.Commit` now serializes the
+  bitmap+dedup+inode snapshot straight into one reusable buffer (`MarshalInto`)
+  instead of allocating a fresh slice per inode. A commit on a 4000-inode image
+  went from 4047 allocs / 1.9 MB to 41 allocs / 94 KB (and the allocation cost is
+  now flat regardless of inode count); the on-disk bytes are byte-identical.
 - [ ] **Stage F** — Rust port (and real BLAKE3, see notes)
 
 ## Design pipeline (data path)

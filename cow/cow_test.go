@@ -87,7 +87,7 @@ func TestCommitPersists(t *testing.T) {
 	activity(t, bm, ddt, 2, 5)
 	wantUsed, wantLen := bm.Used(), ddt.Len()
 
-	if _, err := Commit(dev, ub, bm, ddt, tbl, 0, 1); err != nil {
+	if _, err := Commit(dev, ub, bm, ddt, tbl, 0, 1, nil); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -109,7 +109,7 @@ func commitToSeq2(t *testing.T, dev block.Device) (*Uberblock, uint64, int) {
 	ub, bm, ddt, tbl, _ := Mount(dev)
 	activity(t, bm, ddt, 1, 3)
 	used, length := bm.Used(), ddt.Len()
-	ub2, err := Commit(dev, ub, bm, ddt, tbl, 0, 1)
+	ub2, err := Commit(dev, ub, bm, ddt, tbl, 0, 1, nil)
 	if err != nil {
 		t.Fatalf("seq2 commit: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestCrashDuringMetadata(t *testing.T) {
 	activity(t, bm, ddt, 1, 3)
 	activity(t, bm, ddt, 2, 9)
 	flaky := &flakyDevice{Device: dev, failAt: 1}
-	if _, err := Commit(flaky, ub2, bm, ddt, tbl, 0, 1); err == nil {
+	if _, err := Commit(flaky, ub2, bm, ddt, tbl, 0, 1, nil); err == nil {
 		t.Fatal("expected commit to fail mid-metadata")
 	}
 
@@ -142,7 +142,7 @@ func TestCrashDuringUberblock(t *testing.T) {
 	// Metadata writes (MetaBlocks of them) succeed; the very next write is the
 	// uberblock — tear it. The checksum must reject the torn slot on remount.
 	flaky := &flakyDevice{Device: dev, failAt: int(ub2.MetaBlocks) + 1}
-	if _, err := Commit(flaky, ub2, bm, ddt, tbl, 0, 1); err == nil {
+	if _, err := Commit(flaky, ub2, bm, ddt, tbl, 0, 1, nil); err == nil {
 		t.Fatal("expected commit to fail during uberblock flip")
 	}
 

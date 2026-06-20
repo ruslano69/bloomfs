@@ -62,7 +62,7 @@ func Format(dev block.Device, inodeCount, ddtReserve uint64) (*Uberblock, error)
 		NextInode:   1, // inode 0 is the root directory
 	}
 
-	if err := writeSnapshot(dev, ub, bm, ddt, tbl); err != nil {
+	if err := writeSnapshot(dev, ub, bm, ddt, tbl, nil); err != nil {
 		return nil, err
 	}
 	if err := writeUber(dev, ub); err != nil {
@@ -122,14 +122,18 @@ func Mount(dev block.Device) (*Uberblock, *alloc.Bitmap, *dedup.Table, *inode.Ta
 // Commit atomically records a new consistent state: it snapshots bm+ddt+tbl into
 // the inactive metadata slot (synced), then flips the uberblock (synced). On any
 // failure the previous commit remains valid; remounting rolls back to it.
-func Commit(dev block.Device, prev *Uberblock, bm *alloc.Bitmap, ddt *dedup.Table, tbl *inode.Table, rootInode, nextInode uint64) (*Uberblock, error) {
+//
+// scratch is an optional reusable serialization buffer (>= MetaBlocks*BlockSize):
+// the hot path passes a persistent one so a commit allocates nothing; nil makes
+// writeSnapshot allocate a fresh buffer.
+func Commit(dev block.Device, prev *Uberblock, bm *alloc.Bitmap, ddt *dedup.Table, tbl *inode.Table, rootInode, nextInode uint64, scratch []byte) (*Uberblock, error) {
 	next := *prev // inherit geometry
 	next.Seq = prev.Seq + 1
 	next.ActiveMeta = 1 - prev.ActiveMeta // alternate metadata slot
 	next.RootInode = rootInode
 	next.NextInode = nextInode
 
-	if err := writeSnapshot(dev, &next, bm, ddt, tbl); err != nil {
+	if err := writeSnapshot(dev, &next, bm, ddt, tbl, scratch); err != nil {
 		return nil, err
 	}
 	if err := writeUber(dev, &next); err != nil { // the atomic flip
@@ -144,22 +148,29 @@ func Commit(dev block.Device, prev *Uberblock, bm *alloc.Bitmap, ddt *dedup.Tabl
 }
 
 // writeSnapshot serializes bm+ddt+tbl into ub's active metadata slot, recording
-// the three lengths on ub, and syncs.
-func writeSnapshot(dev block.Device, ub *Uberblock, bm *alloc.Bitmap, ddt *dedup.Table, tbl *inode.Table) error {
-	bmBytes := bm.Marshal()
-	ddBytes := ddt.Marshal()
-	inBytes := tbl.Marshal()
-	if uint64(len(bmBytes)+len(ddBytes)+len(inBytes)) > ub.MetaBlocks*block.Size {
+// the three lengths on ub, and syncs. The three structures are marshaled
+// contiguously into one buffer with no intermediate slices; the tail past their
+// combined length is never read on Mount (the uberblock carries each section's
+// length), so a reused scratch buffer with stale tail bytes is safe.
+func writeSnapshot(dev block.Device, ub *Uberblock, bm *alloc.Bitmap, ddt *dedup.Table, tbl *inode.Table, scratch []byte) error {
+	bmLen := bm.MarshalLen()
+	ddLen := ddt.MarshalLen()
+	inLen := tbl.MarshalLen()
+	need := ub.MetaBlocks * block.Size
+	if uint64(bmLen+ddLen+inLen) > need {
 		return ErrMetaTooBig
 	}
-	ub.BitmapLen = uint32(len(bmBytes))
-	ub.DDTLen = uint32(len(ddBytes))
-	ub.InodeLen = uint32(len(inBytes))
 
-	buf := make([]byte, ub.MetaBlocks*block.Size)
-	copy(buf, bmBytes)
-	copy(buf[len(bmBytes):], ddBytes)
-	copy(buf[len(bmBytes)+len(ddBytes):], inBytes)
+	buf := scratch
+	if uint64(len(buf)) < need {
+		buf = make([]byte, need)
+	}
+	bm.MarshalInto(buf[:bmLen])
+	ddt.MarshalInto(buf[bmLen : bmLen+ddLen])
+	tbl.MarshalInto(buf[bmLen+ddLen : bmLen+ddLen+inLen])
+	ub.BitmapLen = uint32(bmLen)
+	ub.DDTLen = uint32(ddLen)
+	ub.InodeLen = uint32(inLen)
 
 	start := ub.metaStart()
 	for i := uint64(0); i < ub.MetaBlocks; i++ {
