@@ -15,7 +15,7 @@ filesystems like ZFS; the Bloom-segmented lookup is what BloomFS adds.
 > Status: **research prototype — now mountable.** The on-disk layers work end to
 > end and are covered by tests (including crash-injection), and a FUSE binding
 > (`fusefs` + the `bloomfs` CLI) mounts the filesystem on a real kernel:
-> mkdir/read/write/append/hardlink/symlink/rename/rmdir, multi-record large files
+> mkdir/read/write/append/hardlink/symlink/rename/rmdir/fallocate, multi-record large files
 > with verified data integrity, `df`/`df -i` capacity reporting, persistence
 > across remount, POSIX permission enforcement (`chmod`/`chown` under
 > `default_permissions`, including unlink-of-open survival), and encrypted pools
@@ -122,7 +122,7 @@ filesystems like ZFS; the Bloom-segmented lookup is what BloomFS adds.
 ## Design pipeline (data path)
 
 ```
-plaintext → BLAKE hash → dedup lookup
+plaintext → BLAKE2b-256 hash → dedup lookup
    HIT  → RefCount++            (no compress, no encrypt, no write)
    MISS → ZSTD → AES-XTS (tweak = cluster addr) → write → record checksum
 ```
