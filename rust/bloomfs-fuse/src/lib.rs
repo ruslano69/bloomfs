@@ -105,12 +105,63 @@ fn fill_attr(st: &Stat) -> FileAttr {
     }
 }
 
+/// One entry in a frozen directory snapshot taken at `opendir`. Holds the
+/// kernel-facing ino, the FUSE file-type and the name — everything `readdir`
+/// needs to emit a row without touching the live filesystem again.
+struct DirEntrySnapshot {
+    ino: u64,
+    kind: FileType,
+    name: String,
+}
+
+/// Take a point-in-time snapshot of directory `ino`'s entries, prefixed with the
+/// mandatory `.` and `..` rows.
+///
+/// This is the heart of the readdir-consistency fix.  The kernel reads a large
+/// directory in several `readdir` calls, each resuming at an opaque cookie (our
+/// entry index).  If every call re-listed the *live* directory, a concurrent
+/// `mkdir`/`unlink`/`rename` between two calls would shift indices and make the
+/// paginated `ls` skip or duplicate names.  By freezing the listing once at
+/// `opendir` and serving every `readdir` from that frozen `Vec`, the cookie is
+/// stable for the life of the directory stream — exactly the POSIX guarantee
+/// (entries present for the whole scan appear exactly once; concurrently
+/// added/removed entries may or may not appear, but never corrupt the scan).
+fn snapshot_dir<D: Device>(fs: &FS<D>, ino: u64) -> std::result::Result<Vec<DirEntrySnapshot>, Error> {
+    let ents = fs.readdirents(id_of(ino))?;
+    let mut snap = Vec::with_capacity(ents.len() + 2);
+    // "." and ".." first, as the kernel expects.  We don't track the parent
+    // ino, so ".." reports self — the kernel resolves it via its own dcache.
+    snap.push(DirEntrySnapshot {
+        ino,
+        kind: FileType::Directory,
+        name: ".".to_string(),
+    });
+    snap.push(DirEntrySnapshot {
+        ino,
+        kind: FileType::Directory,
+        name: "..".to_string(),
+    });
+    for e in ents {
+        snap.push(DirEntrySnapshot {
+            ino: ino_of(e.ino),
+            kind: file_type(e.kind),
+            name: e.name,
+        });
+    }
+    Ok(snap)
+}
+
 /// A FUSE filesystem backed by a bloomfs `FS`.
 pub struct BloomFuse<D: Device> {
     fs: FS<D>,
     /// Open file handles, keyed by the fh we hand back to the kernel. Each pins
     /// its inode until release (POSIX unlink-of-open).
     handles: HashMap<u64, Handle>,
+    /// Frozen directory snapshots, keyed by the dir fh from `opendir`. Freezing
+    /// the listing at open time keeps the readdir cookie stable across a
+    /// paginated scan even when the directory is concurrently modified (no
+    /// skipped or duplicated entries — see [`snapshot_dir`]).
+    dir_handles: HashMap<u64, Vec<DirEntrySnapshot>>,
     next_fh: u64,
 }
 
@@ -120,6 +171,7 @@ impl<D: Device> BloomFuse<D> {
         Self {
             fs,
             handles: HashMap::new(),
+            dir_handles: HashMap::new(),
             next_fh: 1,
         }
     }
@@ -633,36 +685,67 @@ impl<D: Device> Filesystem for BloomFuse<D> {
         }
     }
 
-    fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        mut reply: ReplyDirectory,
-    ) {
-        let ents = match self.fs.readdirents(id_of(ino)) {
-            Ok(e) => e,
+    /// Open a directory stream: freeze its entries into a per-fh snapshot so the
+    /// subsequent paginated `readdir` calls are immune to concurrent mutation.
+    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        let snap = match snapshot_dir(&self.fs, ino) {
+            Ok(s) => s,
             Err(e) => {
                 reply.error(errno(&e));
                 return;
             }
         };
-        // The kernel expects "." and ".." first. We don't track the parent ino,
-        // so ".." reports self — the kernel resolves it via its own dcache, the
-        // reported ino is informational only.
-        let mut all: Vec<(u64, FileType, String)> = Vec::with_capacity(ents.len() + 2);
-        all.push((ino, FileType::Directory, ".".to_string()));
-        all.push((ino, FileType::Directory, "..".to_string()));
-        for e in ents {
-            all.push((ino_of(e.ino), file_type(e.kind), e.name));
-        }
-        for (i, (eino, kind, name)) in all.into_iter().enumerate().skip(offset as usize) {
-            // Offset is the cookie to resume *after* this entry.
-            if reply.add(eino, (i + 1) as i64, kind, name) {
+        let fh = self.next_fh;
+        self.next_fh += 1;
+        self.dir_handles.insert(fh, snap);
+        reply.opened(fh, 0);
+    }
+
+    fn readdir(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        // Serve from the frozen snapshot taken at `opendir`. If the fh is unknown
+        // (defensive — e.g. a kernel that skips opendir), build a one-shot
+        // snapshot now so behaviour degrades to "consistent within this call".
+        let owned;
+        let entries: &[DirEntrySnapshot] = match self.dir_handles.get(&fh) {
+            Some(s) => s,
+            None => {
+                owned = match snapshot_dir(&self.fs, ino) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        reply.error(errno(&e));
+                        return;
+                    }
+                };
+                &owned
+            }
+        };
+        for (i, e) in entries.iter().enumerate().skip(offset as usize) {
+            // Offset is the cookie to resume *after* this entry: a stable index
+            // into the frozen snapshot, never shifted by concurrent mutation.
+            if reply.add(e.ino, (i + 1) as i64, e.kind, &e.name) {
                 break;
             }
         }
+        reply.ok();
+    }
+
+    /// Release a directory stream: drop its snapshot.
+    fn releasedir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        reply: ReplyEmpty,
+    ) {
+        self.dir_handles.remove(&fh);
         reply.ok();
     }
 
@@ -763,5 +846,47 @@ mod tests {
         assert_eq!(a.mtime, to_systime(20));
         assert_eq!(a.ctime, to_systime(30));
         assert_eq!(a.blksize, bloomfs_block::SIZE as u32);
+    }
+
+    /// The core readdir-consistency guarantee: a snapshot taken at `opendir` is
+    /// frozen, so concurrent `mkdir`/`rmdir` after the stream is open cannot
+    /// make a paginated scan skip or duplicate entries.
+    #[test]
+    fn readdir_snapshot_stable_across_concurrent_mutation() {
+        use bloomfs_block::MemDevice;
+        let mut fs = FS::format(MemDevice::new(512), None).unwrap();
+        let root = fs.root();
+        fs.mkdir(root, "alpha").unwrap();
+        fs.mkdir(root, "beta").unwrap();
+
+        // "opendir": freeze the listing.
+        let snap = snapshot_dir(&fs, ino_of(root)).unwrap();
+        let names_at_open: Vec<String> = snap.iter().map(|e| e.name.clone()).collect();
+
+        // Concurrent mutation after the stream is open.
+        fs.mkdir(root, "gamma").unwrap();
+        fs.rmdir(root, "alpha").unwrap();
+
+        // The snapshot is byte-for-byte unchanged.
+        let names_now: Vec<String> = snap.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names_at_open, names_now, "snapshot must be frozen at opendir");
+
+        // `.` and `..` lead; pre-existing entries are present exactly once; the
+        // post-open `gamma` is absent and the removed `alpha` still shows.
+        assert_eq!(snap[0].name, ".");
+        assert_eq!(snap[1].name, "..");
+        assert!(snap.iter().any(|e| e.name == "alpha"));
+        assert!(snap.iter().any(|e| e.name == "beta"));
+        assert!(
+            !snap.iter().any(|e| e.name == "gamma"),
+            "an entry created after opendir must not appear in the frozen snapshot"
+        );
+
+        // No duplicate names — the classic skip/duplicate corruption.
+        let mut names: Vec<&str> = snap.iter().map(|e| e.name.as_str()).collect();
+        names.sort_unstable();
+        let mut deduped = names.clone();
+        deduped.dedup();
+        assert_eq!(names, deduped, "snapshot must contain no duplicate names");
     }
 }
