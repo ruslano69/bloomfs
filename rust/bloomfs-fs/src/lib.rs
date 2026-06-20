@@ -84,6 +84,9 @@ pub enum Error {
     Invalid,
     /// Permission denied (EACCES).
     Permission,
+    /// Not enough free space (ENOSPC) — used by `fallocate` when the worst-case
+    /// estimate of required clusters exceeds what the bitmap can provide.
+    NoSpace,
     /// An error from the CoW layer.
     Cow(bloomfs_cow::Error),
     /// An error from the data-path store.
@@ -105,6 +108,7 @@ impl fmt::Display for Error {
             Error::NotEmpty => f.write_str("fs: directory not empty"),
             Error::Invalid => f.write_str("fs: invalid argument"),
             Error::Permission => f.write_str("fs: permission denied"),
+            Error::NoSpace => f.write_str("fs: not enough space"),
             Error::Cow(e) => write!(f, "fs: {e}"),
             Error::Store(e) => write!(f, "fs: {e}"),
             Error::Inode(e) => write!(f, "fs: {e}"),
@@ -904,6 +908,53 @@ impl<D: Device> FS<D> {
             blocks_free: self.bm.available() + self.bm.deferred_count(),
             files: cap,
             files_free: cap - used,
+        }
+    }
+
+    /// Space-availability check for `fallocate(2)`.
+    ///
+    /// BloomFS is content-addressed: we cannot pre-allocate physical clusters
+    /// for data that has not been written yet (unknown hash → unknown dedup
+    /// ratio).  Instead we estimate the **worst case** — assume 0 % dedup, all
+    /// new data is unique — and compare against the current free-block count
+    /// (which already includes deferred-free clusters via `statfs`).
+    ///
+    /// If the check passes, the caller can be confident that `length` bytes of
+    /// entirely non-deduplicable data *could* fit right now.  If it fails, the
+    /// data definitely will not fit even in the best case.  Returns
+    /// `Error::NoSpace` on failure so the FUSE layer can map it to `ENOSPC`.
+    ///
+    /// # Overhead breakdown for `length` bytes
+    ///
+    /// * **Data records** – `ceil(length / record_size)` clusters (each
+    ///   cluster = one 4 KiB block; record_size is 4–32 KiB depending on file
+    ///   size, so records may span multiple clusters).
+    /// * **block_map blob** – one `Ref`-list entry per record (`REF_SIZE` bytes
+    ///   each), rounded up to whole clusters.
+    /// * **Inode update** – already allocated, no new cluster needed.
+    ///
+    /// The inode's existing data is not counted because `fallocate` only asks
+    /// "is there room for `length` more bytes", not "is the whole file free".
+    pub fn fallocate(&self, _id: u64, length: u64) -> Result<()> {
+        if length == 0 {
+            return Ok(());
+        }
+        let (record_size, _) = record_size_for(length);
+        // clusters per data record (record_size is already a multiple of BLK)
+        let clusters_per_rec = record_size / BLK;
+        let n_records = length.div_ceil(record_size);
+        let data_clusters = n_records * clusters_per_rec;
+
+        // block_map blob: n_records × REF_SIZE bytes, rounded to whole clusters
+        let map_bytes = n_records * REF_SIZE as u64;
+        let map_clusters = map_bytes.div_ceil(BLK);
+
+        let needed = data_clusters + map_clusters;
+        let free = self.bm.available() + self.bm.deferred_count();
+        if needed > free {
+            Err(Error::NoSpace)
+        } else {
+            Ok(())
         }
     }
 
@@ -1832,5 +1883,30 @@ mod tests {
             free_after > free_start / 2,
             "after commit, free blocks ({free_after}) should be close to initial ({free_start})"
         );
+    }
+
+    /// `fallocate` returns OK when there is enough room for the worst-case
+    /// (no-dedup) estimate, and `Error::NoSpace` when there clearly is not.
+    #[test]
+    fn fallocate_space_check() {
+        let dev = MemDevice::new(512);
+        let fs = FS::format(dev, None).unwrap();
+
+        // A tiny file (one 4 KiB record + tiny block_map) must always fit.
+        assert!(
+            fs.fallocate(fs.root(), 4096).is_ok(),
+            "4 KiB should fit on a 512-block device"
+        );
+
+        // Requesting the entire device (2 MiB) on a device that has ~124 free
+        // blocks after format must be rejected.
+        let two_mib = 512 * 4096u64;
+        assert!(
+            matches!(fs.fallocate(fs.root(), two_mib), Err(Error::NoSpace)),
+            "2 MiB fallocate on a nearly-full device must return NoSpace"
+        );
+
+        // Zero-length is always OK.
+        assert!(fs.fallocate(fs.root(), 0).is_ok());
     }
 }

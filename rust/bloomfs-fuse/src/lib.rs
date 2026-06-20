@@ -27,7 +27,8 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{
-    c_int, EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, O_TRUNC,
+    c_int, EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY,
+    EOPNOTSUPP, O_TRUNC,
 };
 
 /// Attribute/entry cache lifetime handed to the kernel. One second mirrors the
@@ -75,6 +76,7 @@ fn errno(e: &Error) -> c_int {
         Error::IsDir => EISDIR,
         Error::NotEmpty => ENOTEMPTY,
         Error::NoInodes => ENOSPC,
+        Error::NoSpace => ENOSPC,
         Error::Invalid => EINVAL,
         Error::NotFile => EINVAL,
         Error::Permission => EACCES,
@@ -566,6 +568,47 @@ impl<D: Device> Filesystem for BloomFuse<D> {
         reply: ReplyEmpty,
     ) {
         match self.fs.fsync() {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    /// Pre-flight space check for `fallocate(2)` / `posix_fallocate(3)`.
+    ///
+    /// BloomFS is content-addressed: actual cluster addresses are assigned at
+    /// write time (after hashing + dedup), so it is impossible to truly
+    /// pre-allocate clusters for data that does not exist yet.  Instead we
+    /// perform a **worst-case estimate** (0 % dedup, all unique data) and
+    /// return `ENOSPC` immediately if even that best-case scenario would
+    /// exhaust the bitmap.  This gives callers a fast, cheap "will it fit?"
+    /// answer before committing to a potentially multi-GB write.
+    ///
+    /// Modes not supported (punch-hole, zero-range, keep-size) return
+    /// `EOPNOTSUPP`; the kernel or libc will then fall back transparently.
+    fn fallocate(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _offset: i64,
+        length: i64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        // We only support mode=0 (the standard "ensure space for [offset,
+        // offset+length) and extend file size if needed" variant).  Any flag
+        // (FALLOC_FL_KEEP_SIZE=1, FALLOC_FL_PUNCH_HOLE=2, etc.) means the
+        // caller wants semantics we can't provide — return EOPNOTSUPP so the
+        // kernel/libc falls back to emulation.
+        if mode != 0 {
+            reply.error(EOPNOTSUPP);
+            return;
+        }
+        if length <= 0 {
+            reply.ok();
+            return;
+        }
+        match self.fs.fallocate(id_of(ino), length as u64) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(&e)),
         }
