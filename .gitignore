@@ -7,6 +7,9 @@
 *.img
 *.bin
 
+# Rust build artifacts (Cargo.lock is kept — this is an application workspace)
+rust/target/
+
 # Editor / OS noise
 .idea/
 .vscode/
