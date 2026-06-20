@@ -14,3 +14,10 @@ bloomfs-dedup = { path = "../bloomfs-dedup" }
 bloomfs-dir = { path = "../bloomfs-dir" }
 bloomfs-cow = { path = "../bloomfs-cow" }
 bloomfs-store = { path = "../bloomfs-store" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "fs_bench"
+harness = false
