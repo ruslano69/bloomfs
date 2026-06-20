@@ -1,0 +1,16 @@
+[package]
+name = "bloomfs-fs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "BloomFS integration layer: wires dir + inode + store + cow into a VFS-style API (Mkdir/Create/Lookup/Read/Write/Readdir/Unlink/Rename/Commit), crash-atomic via one CoW metadata snapshot."
+
+[dependencies]
+bloomfs-block = { path = "../bloomfs-block" }
+bloomfs-alloc = { path = "../bloomfs-alloc" }
+bloomfs-inode = { path = "../bloomfs-inode" }
+bloomfs-dedup = { path = "../bloomfs-dedup" }
+bloomfs-dir = { path = "../bloomfs-dir" }
+bloomfs-cow = { path = "../bloomfs-cow" }
+bloomfs-store = { path = "../bloomfs-store" }

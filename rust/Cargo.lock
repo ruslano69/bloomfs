@@ -78,6 +78,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomfs-fs"
+version = "0.1.0"
+dependencies = [
+ "bloomfs-alloc",
+ "bloomfs-block",
+ "bloomfs-cow",
+ "bloomfs-dedup",
+ "bloomfs-dir",
+ "bloomfs-inode",
+ "bloomfs-store",
+]
+
+[[package]]
 name = "bloomfs-inode"
 version = "0.1.0"
 dependencies = [
