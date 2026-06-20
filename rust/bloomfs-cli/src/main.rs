@@ -9,13 +9,14 @@
 //! AES-XTS; an empty key uses a plaintext pool. Metadata is made durable on a
 //! clean unmount (CoW commit); a hard crash rolls back to the last commit.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc;
 
-use bloomfs_block::{FileDevice, SIZE};
+use bloomfs_block::{Device, FileDevice, RawDevice, SIZE};
 use bloomfs_fs::FS;
 use clap::{Parser, Subcommand};
+use std::os::unix::fs::FileTypeExt;
 
 #[derive(Parser)]
 #[command(name = "bloomfs", about = "Format and mount a BloomFS image", version)]
@@ -79,11 +80,39 @@ fn parse_key(h: &str) -> Result<Option<Vec<u8>>, String> {
     Ok(Some(key))
 }
 
-fn do_format(size_mib: u64, key_hex: &str, image: &PathBuf) -> Result<(), String> {
+fn do_format(size_mib: u64, key_hex: &str, image: &Path) -> Result<(), String> {
     let key = parse_key(key_hex)?;
-    let blocks = size_mib * 1024 * 1024 / SIZE as u64;
-    let dev = FileDevice::create(image, blocks).map_err(|e| format!("create image: {e}"))?;
-    let mut fs = FS::format(dev, key.as_deref()).map_err(|e| format!("format: {e}"))?;
+    // Block device: format in place (it already exists, ignore --size).
+    // Regular file / new path: create a fixed-size image.
+    let is_blk = image
+        .metadata()
+        .map(|m| m.file_type().is_block_device())
+        .unwrap_or(false);
+    if is_blk {
+        let dev = RawDevice::open(image).map_err(|e| format!("open device: {e}"))?;
+        let blocks = dev.blocks();
+        do_format_on(
+            dev,
+            key.as_deref(),
+            image,
+            blocks,
+            blocks * SIZE as u64 / (1024 * 1024),
+        )
+    } else {
+        let blocks = size_mib * 1024 * 1024 / SIZE as u64;
+        let dev = FileDevice::create(image, blocks).map_err(|e| format!("create image: {e}"))?;
+        do_format_on(dev, key.as_deref(), image, blocks, size_mib)
+    }
+}
+
+fn do_format_on<D: Device>(
+    dev: D,
+    key: Option<&[u8]>,
+    image: &Path,
+    blocks: u64,
+    size_mib: u64,
+) -> Result<(), String> {
+    let mut fs = FS::format(dev, key).map_err(|e| format!("format: {e}"))?;
     // The fresh root is owned by uid 0; hand it to the formatting user so they
     // can write to their own pool under default_permissions.
     // SAFETY: getuid/getgid are always-successful syscalls with no preconditions.
@@ -91,7 +120,7 @@ fn do_format(size_mib: u64, key_hex: &str, image: &PathBuf) -> Result<(), String
     fs.chown(fs.root(), uid, gid)
         .map_err(|e| format!("chown root: {e}"))?;
     fs.fsync().map_err(|e| format!("commit: {e}"))?;
-    drop(fs); // closes the device on drop
+    drop(fs);
     println!(
         "formatted {}: {} blocks ({} MiB)",
         image.display(),
@@ -104,12 +133,31 @@ fn do_format(size_mib: u64, key_hex: &str, image: &PathBuf) -> Result<(), String
 fn do_mount(
     key_hex: &str,
     no_dir_cache: bool,
-    image: &PathBuf,
-    mountpoint: &PathBuf,
+    image: &Path,
+    mountpoint: &Path,
 ) -> Result<(), String> {
     let key = parse_key(key_hex)?;
-    let dev = FileDevice::open(image).map_err(|e| format!("open image: {e}"))?;
-    let mut fs = FS::mount(dev, key.as_deref()).map_err(|e| format!("mount fs: {e}"))?;
+    let is_blk = image
+        .metadata()
+        .map(|m| m.file_type().is_block_device())
+        .unwrap_or(false);
+    if is_blk {
+        let dev = RawDevice::open(image).map_err(|e| format!("open device: {e}"))?;
+        do_mount_on(dev, key.as_deref(), no_dir_cache, image, mountpoint)
+    } else {
+        let dev = FileDevice::open(image).map_err(|e| format!("open image: {e}"))?;
+        do_mount_on(dev, key.as_deref(), no_dir_cache, image, mountpoint)
+    }
+}
+
+fn do_mount_on<D: Device + Send + 'static>(
+    dev: D,
+    key: Option<&[u8]>,
+    no_dir_cache: bool,
+    image: &Path,
+    mountpoint: &Path,
+) -> Result<(), String> {
+    let mut fs = FS::mount(dev, key).map_err(|e| format!("mount fs: {e}"))?;
     if no_dir_cache {
         fs.set_dir_cache(false); // opt out of the default resident dir cache
     }

@@ -14,6 +14,7 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -184,6 +185,91 @@ impl Device for FileDevice {
     }
 }
 
+/// `BLKGETSIZE64`: Linux ioctl that returns the device size in bytes (u64).
+/// `_IOR(0x12, 114, u64)` = 0x80081272 on 64-bit Linux.
+#[cfg(target_os = "linux")]
+const BLKGETSIZE64: libc::c_ulong = 0x80081272;
+
+/// Query the size of a block device file descriptor via `BLKGETSIZE64`.
+#[cfg(target_os = "linux")]
+fn blk_size_bytes(f: &File) -> Result<u64> {
+    let mut size: u64 = 0;
+    // SAFETY: fd is valid; ioctl writes exactly u64 into `size` on success.
+    let ret = unsafe { libc::ioctl(f.as_raw_fd(), BLKGETSIZE64, &mut size) };
+    if ret == -1 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    Ok(size)
+}
+
+/// A [`Device`] backed by a raw Linux block device node (e.g. `/dev/sda`,
+/// `/dev/nvme0n1`, `/dev/ram0`, or a loop device created with `losetup`).
+///
+/// The device must be at least one block (4 KiB) in size and the caller needs
+/// read + write permission on the node (typically root or the `disk` group).
+/// No partition table awareness — the whole device is treated as a flat block
+/// array, exactly like a file image.
+///
+/// ```text
+/// # losetup /dev/loop0 disk.img          # wire a file as a block device
+/// $ bloomfs format /dev/loop0             # format it
+/// $ bloomfs mount /dev/loop0 /mnt         # mount it
+/// ```
+#[cfg(target_os = "linux")]
+pub struct RawDevice {
+    f: File,
+    blocks: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl RawDevice {
+    /// Open a raw block device node. Fails with an I/O error if `path` is not
+    /// a block device or the kernel rejects `BLKGETSIZE64` (e.g. `ENOTTY` for
+    /// a regular file, `EACCES` for insufficient permissions).
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.as_ref())?;
+        let size = blk_size_bytes(&f)?;
+        Ok(RawDevice {
+            f,
+            blocks: size / SIZE as u64,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Device for RawDevice {
+    fn read_block(&self, num: u64) -> Result<Vec<u8>> {
+        if num >= self.blocks {
+            return Err(Error::OutOfRange);
+        }
+        let mut out = vec![0u8; SIZE];
+        self.f.read_exact_at(&mut out, num * SIZE as u64)?;
+        Ok(out)
+    }
+
+    fn write_block(&self, num: u64, data: &[u8]) -> Result<()> {
+        if num >= self.blocks {
+            return Err(Error::OutOfRange);
+        }
+        if data.len() != SIZE {
+            return Err(Error::ShortData);
+        }
+        self.f.write_all_at(data, num * SIZE as u64)?;
+        Ok(())
+    }
+
+    fn blocks(&self) -> u64 {
+        self.blocks
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.f.sync_all().map_err(Error::Io)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +303,43 @@ mod tests {
     #[test]
     fn mem_device() {
         round_trip(&MemDevice::new(8));
+    }
+
+    /// `RawDevice::open` on a plain file must fail — `BLKGETSIZE64` is not
+    /// valid for regular files and the kernel returns `ENOTTY`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_device_rejects_regular_file() {
+        let path =
+            std::env::temp_dir().join(format!("bloomfs_raw_test_{}.tmp", std::process::id()));
+        std::fs::write(&path, vec![0u8; SIZE * 4]).unwrap();
+        let result = RawDevice::open(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_err(),
+            "RawDevice::open must fail on a regular file (ENOTTY)"
+        );
+    }
+
+    /// Full round-trip on a real block device.  Skipped unless the environment
+    /// provides one:  `BLOOMFS_TEST_DEV=/dev/loop0 cargo test raw_device`.
+    ///
+    /// Quick setup:
+    /// ```text
+    /// truncate -s 8M /tmp/test.img
+    /// sudo losetup /dev/loop0 /tmp/test.img
+    /// BLOOMFS_TEST_DEV=/dev/loop0 cargo test -p bloomfs-block raw_device_round_trip -- --ignored
+    /// sudo losetup -d /dev/loop0
+    /// ```
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a block device; set BLOOMFS_TEST_DEV=/dev/loopX after losetup"]
+    fn raw_device_round_trip() {
+        let path = std::env::var("BLOOMFS_TEST_DEV").unwrap_or("/dev/loop0".into());
+        let d = RawDevice::open(&path).expect("open block device");
+        assert!(d.blocks() >= 2, "device too small");
+        round_trip(&d);
+        d.sync().expect("sync");
     }
 
     #[test]
