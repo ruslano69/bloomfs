@@ -22,6 +22,14 @@ name = "bloomfs-dedup"
 version = "0.1.0"
 
 [[package]]
+name = "bloomfs-dir"
+version = "0.1.0"
+dependencies = [
+ "bloomfs-bloom",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "bloomfs-inode"
 version = "0.1.0"
 dependencies = [

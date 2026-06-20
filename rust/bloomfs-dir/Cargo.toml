@@ -1,0 +1,11 @@
+[package]
+name = "bloomfs-dir"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "BloomFS directory subsystem: Bloom-segmented name -> inode index (Stage A, in-memory)."
+
+[dependencies]
+bloomfs-bloom = { path = "../bloomfs-bloom" }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
