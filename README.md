@@ -1,7 +1,7 @@
 # BloomFS
 
 An experimental high-throughput, crypto-deduplicating filesystem core, written
-in Go (with a planned Rust port). The design goal: **instant directory lookups**,
+in Go and Rust. The design goal: **instant directory lookups**,
 **parallel async reads**, and resistance to fragmentation — with **transparent
 compression, encryption, and block deduplication** layered on top.
 
@@ -117,12 +117,12 @@ filesystems like ZFS; the Bloom-segmented lookup is what BloomFS adds.
   instead of allocating a fresh slice per inode. A commit on a 4000-inode image
   went from 4047 allocs / 1.9 MB to 41 allocs / 94 KB (and the allocation cost is
   now flat regardless of inode count); the on-disk bytes are byte-identical.
-- [ ] **Stage F** — Rust port (and real BLAKE3, see notes)
+- [x] **Stage F** — Rust port complete (11 crates, ~6 200 lines; BLAKE3 deployed)
 
 ## Design pipeline (data path)
 
 ```
-plaintext → BLAKE2b-256 hash → dedup lookup
+plaintext → BLAKE3 hash → dedup lookup
    HIT  → RefCount++            (no compress, no encrypt, no write)
    MISS → ZSTD → AES-XTS (tweak = cluster addr) → write → record checksum
 ```
@@ -134,8 +134,9 @@ doubles as an end-to-end integrity check on read.
 
 ## Notes
 
-- **Dedup hash:** currently **BLAKE2b-256** (via `golang.org/x/crypto`) as a
-  drop-in for BLAKE3 — same cryptographic role; BLAKE3 lands with the Rust port.
+- **Dedup hash:** **BLAKE3-256** in the Rust port (`blake3` crate). The Go
+  prototype uses BLAKE2b-256 (`golang.org/x/crypto`) as a structural stand-in;
+  on-disk dedup keys are not cross-compatible between the two implementations.
 - **CoW commits:** an "uberblock" in two alternating slots carries a sequence
   number and a checksum. A commit writes the metadata snapshot, then flips the
   uberblock; a torn write is rejected by the checksum and mount rolls back to the
@@ -143,32 +144,47 @@ doubles as an end-to-end integrity check on read.
 - The full design specification (Russian) is in [docs/SPEC.md](docs/SPEC.md) and
   drives the staged implementation — including the resolved decisions on
   Copy-on-Write, deduplication, recordsize, and compression/encryption modes.
-- The architecture and on-disk format are now **frozen** (SPEC §E10); the Rust
-  port is planned in [docs/PORTING.md](docs/PORTING.md) — layer-by-layer order,
-  crate mapping, the bloom-library split, and the deferred-optimization backlog.
+- The architecture and on-disk format are **frozen** (SPEC §E10); the completed
+  Rust port is documented in [docs/PORTING.md](docs/PORTING.md) — layer-by-layer
+  order, crate mapping, the bloom-library split, and the deferred-optimization
+  backlog.
 
 ## Build & test
 
+**Go prototype** (requires Go 1.26+):
 ```sh
 go build ./...
 go test ./...
 ```
 
-Requires Go 1.26+.
+**Rust port** (requires Rust 1.96+):
+```sh
+cd rust
+cargo build --release
+cargo test --workspace
+```
 
 ## Mounting
 
+**Rust (recommended):**
+```sh
+cd rust && cargo build --release
+./target/release/bloomfs format --size 64 disk.img   # 64 MiB plaintext image
+./target/release/bloomfs mount disk.img /mnt/bloom   # mount until Ctrl-C / umount
+```
+
+**Go prototype:**
 ```sh
 go build -o bloomfs ./cmd/bloomfs
-
-./bloomfs format -size 64 disk.img          # 64 MiB plaintext image
-./bloomfs mount disk.img /mnt/bloom         # mount until Ctrl-C / umount
+./bloomfs format -size 64 disk.img
+./bloomfs mount disk.img /mnt/bloom
 ```
 
 For an encrypted pool pass a 32- or 64-byte key as hex to both commands
-(`-key <hex>`); an empty key mounts a plaintext pool. Metadata is made durable on
-`fsync` and on a clean unmount (CoW commit); a hard crash rolls back to the last
-commit. Mounting needs a FUSE-capable host (`/dev/fuse`, `fusermount3`).
+(`--key <hex>` in Rust, `-key <hex>` in Go); an empty key mounts a plaintext pool.
+Metadata is made durable on `fsync` and on a clean unmount (CoW commit); a hard
+crash rolls back to the last commit. Mounting needs a FUSE-capable host
+(`/dev/fuse`, `fusermount3`).
 
 ## License
 
