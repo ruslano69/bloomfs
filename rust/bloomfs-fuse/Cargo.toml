@@ -1,0 +1,16 @@
+[package]
+name = "bloomfs-fuse"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "BloomFS FUSE binding: a thin shim translating kernel calls onto the bloomfs-fs VFS API (no storage logic of its own)."
+
+[dependencies]
+bloomfs-block = { path = "../bloomfs-block" }
+bloomfs-inode = { path = "../bloomfs-inode" }
+bloomfs-fs = { path = "../bloomfs-fs" }
+# default-features = false: mount via the fusermount3 helper binary instead of
+# linking libfuse (the C dev headers are not assumed present).
+fuser = { version = "0.15", default-features = false }
+libc = "0.2"
