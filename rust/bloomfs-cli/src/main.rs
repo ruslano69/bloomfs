@@ -42,6 +42,9 @@ enum Command {
         /// AES-XTS key in hex (empty = plaintext).
         #[arg(long, default_value = "")]
         key: String,
+        /// Disable the resident open-directory cache (slower lookups, less RAM).
+        #[arg(long)]
+        no_dir_cache: bool,
         /// Path of the image file to mount.
         image: PathBuf,
         /// Directory to mount the filesystem on.
@@ -98,10 +101,18 @@ fn do_format(size_mib: u64, key_hex: &str, image: &PathBuf) -> Result<(), String
     Ok(())
 }
 
-fn do_mount(key_hex: &str, image: &PathBuf, mountpoint: &PathBuf) -> Result<(), String> {
+fn do_mount(
+    key_hex: &str,
+    no_dir_cache: bool,
+    image: &PathBuf,
+    mountpoint: &PathBuf,
+) -> Result<(), String> {
     let key = parse_key(key_hex)?;
     let dev = FileDevice::open(image).map_err(|e| format!("open image: {e}"))?;
-    let fs = FS::mount(dev, key.as_deref()).map_err(|e| format!("mount fs: {e}"))?;
+    let mut fs = FS::mount(dev, key.as_deref()).map_err(|e| format!("mount fs: {e}"))?;
+    if no_dir_cache {
+        fs.set_dir_cache(false); // opt out of the default resident dir cache
+    }
 
     let session = bloomfs_fuse::spawn(fs, mountpoint).map_err(|e| format!("fuse mount: {e}"))?;
     println!(
@@ -129,9 +140,10 @@ fn run() -> Result<(), String> {
         Command::Format { size, key, image } => do_format(size, &key, &image),
         Command::Mount {
             key,
+            no_dir_cache,
             image,
             mountpoint,
-        } => do_mount(&key, &image, &mountpoint),
+        } => do_mount(&key, no_dir_cache, &image, &mountpoint),
     }
 }
 

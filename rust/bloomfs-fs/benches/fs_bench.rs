@@ -61,7 +61,8 @@ fn pseudo_random(buf: &mut [u8]) {
 }
 
 fn bench_lookup_hit(c: &mut Criterion) {
-    let (fs, root, names, _) = bench_fs(4000); // 2 segments
+    let (mut fs, root, names, _) = bench_fs(4000); // 2 segments
+    fs.set_dir_cache(false); // measure the cache-free reload baseline
     let mut i = 0usize;
     c.bench_function("lookup_hit", |b| {
         b.iter(|| {
@@ -74,10 +75,42 @@ fn bench_lookup_hit(c: &mut Criterion) {
 }
 
 fn bench_lookup_miss(c: &mut Criterion) {
-    let (fs, root, _, _) = bench_fs(4000);
+    let (mut fs, root, _, _) = bench_fs(4000);
+    fs.set_dir_cache(false); // measure the cache-free reload baseline
     let miss: Vec<String> = (0..4000).map(|i| format!("absent_{i:06}.dat")).collect();
     let mut i = 0usize;
     c.bench_function("lookup_miss", |b| {
+        b.iter(|| {
+            let r = fs.lookup(root, &miss[i % miss.len()]).unwrap();
+            assert!(r.is_none(), "hit on absent name");
+            black_box(r);
+            i += 1;
+        })
+    });
+}
+
+fn bench_lookup_hit_cached(c: &mut Criterion) {
+    let (mut fs, root, names, _) = bench_fs(4000);
+    fs.set_dir_cache(true);
+    fs.lookup(root, &names[0]).unwrap(); // prime the resident directory
+    let mut i = 0usize;
+    c.bench_function("lookup_hit_cached", |b| {
+        b.iter(|| {
+            let r = fs.lookup(root, &names[i % names.len()]).unwrap();
+            assert!(r.is_some(), "miss on present name");
+            black_box(r);
+            i += 1;
+        })
+    });
+}
+
+fn bench_lookup_miss_cached(c: &mut Criterion) {
+    let (mut fs, root, _, _) = bench_fs(4000);
+    fs.set_dir_cache(true);
+    fs.lookup(root, "absent_000000.dat").unwrap(); // prime the resident directory
+    let miss: Vec<String> = (0..4000).map(|i| format!("absent_{i:06}.dat")).collect();
+    let mut i = 0usize;
+    c.bench_function("lookup_miss_cached", |b| {
         b.iter(|| {
             let r = fs.lookup(root, &miss[i % miss.len()]).unwrap();
             assert!(r.is_none(), "hit on absent name");
@@ -211,6 +244,8 @@ criterion_group!(
     benches,
     bench_lookup_hit,
     bench_lookup_miss,
+    bench_lookup_hit_cached,
+    bench_lookup_miss_cached,
     bench_stat,
     bench_create_unlink,
     bench_write_at_4k,

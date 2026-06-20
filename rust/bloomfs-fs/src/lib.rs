@@ -33,6 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Mutex;
 
 use bloomfs_block::Device;
 use bloomfs_cow::Uberblock;
@@ -162,6 +163,17 @@ pub struct FS<D: Device> {
     clock: Clock,
     /// Reusable CoW snapshot serialization buffer, sized to one metadata slot.
     meta_buf: Vec<u8>,
+
+    /// Resident open-directory cache (§B11). When enabled, a directory's decoded
+    /// name index + page layout stays in RAM across operations, so a lookup/readdir
+    /// hit skips the per-op page decrypt and Bloom-index rebuild. It is on by
+    /// default and can be turned off (`set_dir_cache(false)`) to fall back to the
+    /// always-reload baseline. Interior-mutable so reader ops keep their `&self`
+    /// signature while populating the cache on a miss. The cached entry holds only
+    /// the structural index — the directory's own inode is re-read from the table
+    /// on every checkout, so a `chmod`/`chown`/`utimes` on the directory id (which
+    /// bypasses this cache) can never be clobbered by a later cached mutation.
+    dir_cache: Option<Mutex<HashMap<u64, CachedDir>>>,
 }
 
 // --- directory page cache (one resident open directory) ---
@@ -441,6 +453,7 @@ impl<D: Device> FS<D> {
             free_inodes,
             clock: Box::new(default_now),
             meta_buf,
+            dir_cache: Some(Mutex::new(HashMap::new())),
         })
     }
 
@@ -453,6 +466,18 @@ impl<D: Device> FS<D> {
     /// Override the wall clock (deterministic tests, §F6).
     pub fn set_clock(&mut self, clock: Clock) {
         self.clock = clock;
+    }
+
+    /// Enable or disable the resident open-directory cache (§B11), a performance
+    /// optimization that is on by default. Disabling drops every resident
+    /// directory; the next access reloads from the committed image. Toggling never
+    /// affects correctness — the cache is a pure mirror of the in-RAM metadata.
+    pub fn set_dir_cache(&mut self, on: bool) {
+        self.dir_cache = if on {
+            Some(Mutex::new(HashMap::new()))
+        } else {
+            None
+        };
     }
 
     /// The root directory's inode id.
@@ -635,9 +660,10 @@ impl<D: Device> FS<D> {
 
     // --- directory helpers ---
 
-    /// Load a directory inode and rebuild both its Bloom-segmented index and its
-    /// page layout. (The Go open-directory cache is a deferred optimization.)
-    fn open_dir(&self, id: u64) -> Result<CachedDir> {
+    /// Load a directory inode from disk and rebuild both its Bloom-segmented
+    /// index and its page layout. This is the cache-free primitive; the resident
+    /// cache (when enabled) is layered on top by `checkout_dir`/`cache_peek`.
+    fn load_dir(&self, id: u64) -> Result<CachedDir> {
         let in_ = self.inodes.get(id)?;
         if in_.kind != TYPE_DIR {
             return Err(Error::NotDir);
@@ -667,6 +693,58 @@ impl<D: Device> FS<D> {
         Ok(h)
     }
 
+    /// Acquire a working copy of directory `id` for mutation. With the cache on,
+    /// take the resident entry out of the map (it is returned by `commit_dir`) and
+    /// refresh its inode from the table — the resident index is authoritative for
+    /// the *entries*, but the directory's own inode may have changed underneath it
+    /// (e.g. a `chmod`). A miss (or a disabled cache) falls back to a disk load.
+    fn checkout_dir(&self, id: u64) -> Result<CachedDir> {
+        if let Some(cache) = &self.dir_cache {
+            if let Some(mut h) = cache.lock().unwrap().remove(&id) {
+                h.in_ = self.inodes.get(id)?;
+                return Ok(h);
+            }
+        }
+        self.load_dir(id)
+    }
+
+    /// Persist a working directory (its dirty pages) and, with the cache on, place
+    /// it back into the resident map so the next access skips the disk reload.
+    fn commit_dir(&mut self, id: u64, mut h: CachedDir) -> Result<()> {
+        self.flush_dir(id, &mut h)?;
+        if let Some(cache) = &self.dir_cache {
+            cache.lock().unwrap().insert(id, h);
+        }
+        Ok(())
+    }
+
+    /// Drop directory `id` from the resident cache (after it is unlinked/reclaimed
+    /// or its id recycled). A no-op when the cache is off or the id is absent.
+    fn evict_dir(&self, id: u64) {
+        if let Some(cache) = &self.dir_cache {
+            cache.lock().unwrap().remove(&id);
+        }
+    }
+
+    /// Run `f` over directory `id`'s resident index, loading and caching it on a
+    /// miss. Returns `Ok(None)` when the cache is disabled, signalling the caller
+    /// to take its cache-free path. Reader ops keep their `&self` signature: the
+    /// `Mutex` provides the interior mutability needed to populate on a miss, and
+    /// `f` only reads the index (never the directory inode), so a stale cached
+    /// inode is irrelevant here.
+    fn cache_peek<T>(&self, id: u64, f: impl FnOnce(&CachedDir) -> T) -> Result<Option<T>> {
+        let cache = match &self.dir_cache {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let mut g = cache.lock().unwrap();
+        if let std::collections::hash_map::Entry::Vacant(e) = g.entry(id) {
+            let h = self.load_dir(id)?;
+            e.insert(h);
+        }
+        Ok(Some(f(g.get(&id).unwrap())))
+    }
+
     /// Persist every page changed since load, each as one record-addressable
     /// `write_at` at its fixed page offset — untouched pages keep their refs.
     fn flush_dir(&mut self, id: u64, h: &mut CachedDir) -> Result<()> {
@@ -681,7 +759,7 @@ impl<D: Device> FS<D> {
 
     /// Decode directory `id`'s pages into a flat entry list, without building the
     /// Bloom index, page layout or `page_of` map. This is the read-only
-    /// counterpart to `open_dir`: the reader ops (lookup/readdir/...) only need
+    /// counterpart to `load_dir`: the reader ops (lookup/readdir/...) only need
     /// the entries, so they skip the per-entry name clone and the structures
     /// that exist solely to support mutation + flush.
     fn read_dir_pages(&self, id: u64) -> Result<Vec<DirEntry>> {
@@ -705,10 +783,14 @@ impl<D: Device> FS<D> {
 
     /// Resolve `name` in directory `parent` to an inode id.
     pub fn lookup(&self, parent: u64, name: &str) -> Result<Option<u64>> {
-        // A single resolve needs no Bloom index: decode the pages and scan them
-        // directly. Building the per-segment filters would cost a full pass over
-        // every name (plus the hashing) only to answer one query — a linear scan
-        // of the already-decoded entries is cheaper and touches the same data.
+        // With the cache on, the resident Bloom index answers in one filter probe.
+        if let Some(found) = self.cache_peek(parent, |h| h.dir.find(name).map(|i| i.0))? {
+            return Ok(found);
+        }
+        // Cache off: a single resolve needs no Bloom index — decode the pages and
+        // scan them directly. Building the per-segment filters would cost a full
+        // pass over every name only to answer one query; the linear scan over the
+        // already-decoded entries is cheaper and touches the same data.
         for e in self.read_dir_pages(parent)? {
             if e.name == name {
                 return Ok(Some(e.inode.0));
@@ -719,6 +801,11 @@ impl<D: Device> FS<D> {
 
     /// List the names in directory `id` (a one-shot consistent snapshot).
     pub fn readdir(&self, id: u64) -> Result<Vec<String>> {
+        if let Some(names) = self.cache_peek(id, |h| {
+            h.pages.iter().flatten().map(|e| e.name.clone()).collect()
+        })? {
+            return Ok(names);
+        }
         Ok(self
             .read_dir_pages(id)?
             .into_iter()
@@ -728,12 +815,28 @@ impl<D: Device> FS<D> {
 
     /// Return directory `id`'s entries (name + id + type) as one snapshot.
     pub fn readdirents(&self, id: u64) -> Result<Vec<Dirent>> {
-        let mut out = Vec::new();
-        for e in self.read_dir_pages(id)? {
-            let in_ = self.inodes.get(e.inode.0)?;
+        // Collect (name, id) under the cache lock (or from disk), then resolve each
+        // type from the inode table outside it — the closure can't borrow `self`.
+        let pairs: Vec<(String, u64)> = match self.cache_peek(id, |h| {
+            h.pages
+                .iter()
+                .flatten()
+                .map(|e| (e.name.clone(), e.inode.0))
+                .collect()
+        })? {
+            Some(v) => v,
+            None => self
+                .read_dir_pages(id)?
+                .into_iter()
+                .map(|e| (e.name, e.inode.0))
+                .collect(),
+        };
+        let mut out = Vec::with_capacity(pairs.len());
+        for (name, ino) in pairs {
+            let in_ = self.inodes.get(ino)?;
             out.push(Dirent {
-                name: e.name,
-                ino: e.inode.0,
+                name,
+                ino,
                 kind: in_.kind,
             });
         }
@@ -742,14 +845,17 @@ impl<D: Device> FS<D> {
 
     /// Capture a consistent snapshot of directory `id`'s names for iteration.
     pub fn open_dir_stream(&self, id: u64) -> Result<DirHandle> {
-        Ok(DirHandle {
-            entries: self
+        let entries = match self.cache_peek(id, |h| {
+            h.pages.iter().flatten().map(|e| e.name.clone()).collect()
+        })? {
+            Some(v) => v,
+            None => self
                 .read_dir_pages(id)?
                 .into_iter()
                 .map(|e| e.name)
                 .collect(),
-            pos: 0,
-        })
+        };
+        Ok(DirHandle { entries, pos: 0 })
     }
 
     /// Return the metadata of inode `id`.
@@ -819,7 +925,7 @@ impl<D: Device> FS<D> {
     /// the exclusive `&mut self`, so create-then-populate (e.g. symlink) is one
     /// critical section.
     fn create_node(&mut self, parent: u64, name: &str, typ: u8, mode: u16) -> Result<u64> {
-        let mut h = self.open_dir(parent)?;
+        let mut h = self.checkout_dir(parent)?;
         if h.dir.find(name).is_some() {
             return Err(Error::Exists);
         }
@@ -848,7 +954,7 @@ impl<D: Device> FS<D> {
         if typ == TYPE_DIR {
             h.in_.nlink += 1;
         }
-        self.flush_dir(parent, &mut h)?;
+        self.commit_dir(parent, h)?;
         Ok(id)
     }
 
@@ -1045,7 +1151,7 @@ impl<D: Device> FS<D> {
     /// inode and its data are reclaimed only when no names remain (nlink == 0,
     /// §E4) AND no open handle references it (§E3).
     pub fn unlink(&mut self, parent: u64, name: &str) -> Result<()> {
-        let mut h = self.open_dir(parent)?;
+        let mut h = self.checkout_dir(parent)?;
         let id = h.dir.find(name).ok_or(Error::NotFound)?;
         let mut child = self.inodes.get(id.0)?;
         if child.kind == TYPE_DIR {
@@ -1053,7 +1159,7 @@ impl<D: Device> FS<D> {
         }
 
         h.del(name);
-        self.flush_dir(parent, &mut h)?;
+        self.commit_dir(parent, h)?;
 
         if child.nlink > 0 {
             child.nlink -= 1;
@@ -1068,13 +1174,13 @@ impl<D: Device> FS<D> {
 
     /// Remove an empty subdirectory `name` from `parent` (POSIX rmdir).
     pub fn rmdir(&mut self, parent: u64, name: &str) -> Result<()> {
-        let mut h = self.open_dir(parent)?;
+        let mut h = self.checkout_dir(parent)?;
         let id = h.dir.find(name).ok_or(Error::NotFound)?;
         let child = self.inodes.get(id.0)?;
         if child.kind != TYPE_DIR {
             return Err(Error::NotDir);
         }
-        let ch = self.open_dir(id.0)?;
+        let ch = self.load_dir(id.0)?;
         if !ch.dir.is_empty() {
             return Err(Error::NotEmpty);
         }
@@ -1083,12 +1189,15 @@ impl<D: Device> FS<D> {
         if h.in_.nlink > 0 {
             h.in_.nlink -= 1; // the child's ".." no longer counts toward the parent
         }
-        self.flush_dir(parent, &mut h)?;
+        self.commit_dir(parent, h)?;
         self.reclaim(id.0, &child)
     }
 
     /// Free an inode's data and recycle the id (§F5).
     fn reclaim(&mut self, id: u64, in_: &Inode) -> Result<()> {
+        // If this id named a directory, drop any resident copy: the id is about to
+        // be recycled (with a bumped generation) for an unrelated inode.
+        self.evict_dir(id);
         self.release_data(in_)?;
         // Zero the slot but carry a bumped generation forward, then make the id
         // available for reuse (§F5).
@@ -1146,7 +1255,7 @@ impl<D: Device> FS<D> {
         if target.kind == TYPE_DIR {
             return Err(Error::NotFile);
         }
-        let mut h = self.open_dir(parent)?;
+        let mut h = self.checkout_dir(parent)?;
         if h.dir.find(name).is_some() {
             return Err(Error::Exists);
         }
@@ -1154,7 +1263,7 @@ impl<D: Device> FS<D> {
         self.touch_meta(&mut target); // link-count change bumps ctime (§F6)
         self.inodes.put(target_id, &target)?;
         h.add(name, InodeId(target_id));
-        self.flush_dir(parent, &mut h)
+        self.commit_dir(parent, h)
     }
 
     /// Drop the existing destination's link during a rename overwrite. Returns
@@ -1198,7 +1307,7 @@ impl<D: Device> FS<D> {
         dst_parent: u64,
         dst_name: &str,
     ) -> Result<()> {
-        let mut sh = self.open_dir(src_parent)?;
+        let mut sh = self.checkout_dir(src_parent)?;
         let id = sh.dir.find(src_name).ok_or(Error::NotFound)?;
         // Reject the trivial directory loop: moving a directory into itself.
         if dst_parent == id.0 {
@@ -1213,10 +1322,10 @@ impl<D: Device> FS<D> {
             sh.add(dst_name, id);
             sh.del(src_name);
             self.touch_moved(id.0)?;
-            return self.flush_dir(src_parent, &mut sh);
+            return self.commit_dir(src_parent, sh);
         }
 
-        let mut dh = self.open_dir(dst_parent)?;
+        let mut dh = self.checkout_dir(dst_parent)?;
         if self.rename_overwrite(&mut dh, dst_name, id)? {
             return Ok(());
         }
@@ -1224,8 +1333,8 @@ impl<D: Device> FS<D> {
         sh.del(src_name);
         self.touch_moved(id.0)?;
         // Persist destination first, then source.
-        self.flush_dir(dst_parent, &mut dh)?;
-        self.flush_dir(src_parent, &mut sh)
+        self.commit_dir(dst_parent, dh)?;
+        self.commit_dir(src_parent, sh)
     }
 
     // --- open handles ---
@@ -1551,6 +1660,86 @@ mod tests {
         assert_eq!(sub2, sub);
         let f2 = fs2.lookup(sub2, "f").unwrap().unwrap();
         assert_eq!(fs2.read_file(f2).unwrap(), b"durable");
+    }
+
+    /// A scripted sequence of mutations and reads must produce byte-identical
+    /// results whether the resident open-directory cache is on or off — the cache
+    /// is a pure performance mirror, never a behaviour change.
+    #[test]
+    fn dir_cache_matches_uncached() {
+        fn run(cache: bool) -> (Vec<String>, Vec<String>, Vec<Option<u64>>) {
+            let mut fs = fresh();
+            fs.set_dir_cache(cache); // default is on; force the path under test
+            let root = fs.root();
+            for i in 0..60 {
+                fs.create(root, &format!("f{i}")).unwrap();
+            }
+            // delete every third name (page churn + Bloom tombstones)
+            for i in (0..60).step_by(3) {
+                fs.unlink(root, &format!("f{i}")).unwrap();
+            }
+            let sub = fs.mkdir(root, "sub").unwrap();
+            fs.create(sub, "x").unwrap();
+            fs.link(root, "f1_hard", fs.lookup(root, "f1").unwrap().unwrap())
+                .unwrap();
+            fs.rename(root, "f2", sub, "y").unwrap(); // cross-dir move
+            fs.rename(root, "f4", root, "f5").unwrap(); // same-dir overwrite
+            let mut root_names = fs.readdir(root).unwrap();
+            root_names.sort();
+            let mut sub_names = fs.readdir(sub).unwrap();
+            sub_names.sort();
+            let looks = vec![
+                fs.lookup(root, "f1").unwrap(),
+                fs.lookup(root, "f0").unwrap(), // unlinked -> None
+                fs.lookup(sub, "y").unwrap(),
+                fs.lookup(sub, "absent").unwrap(),
+            ];
+            (root_names, sub_names, looks)
+        }
+        assert_eq!(run(false), run(true), "cache changed observable behaviour");
+    }
+
+    /// The cache must not clobber a directory inode mutated outside it. A `chmod`
+    /// on a directory id goes through the inode table, not the resident handle; a
+    /// later cached `create` in that directory must preserve the new mode (the
+    /// checkout refreshes the inode from the table). Also exercises reclaim/evict.
+    #[test]
+    fn dir_cache_coherent_with_out_of_band_inode_change() {
+        let mut fs = fresh();
+        fs.set_dir_cache(true);
+        let root = fs.root();
+        let d = fs.mkdir(root, "d").unwrap();
+        // populate the cache via reads + a write
+        assert_eq!(fs.lookup(root, "d").unwrap(), Some(d));
+        let f = fs.create(d, "f").unwrap();
+        assert_eq!(fs.lookup(d, "f").unwrap(), Some(f));
+
+        // chmod the directory: bypasses the cache (inode-table path).
+        fs.chmod(d, 0o700).unwrap();
+        // a cached mutation in the same directory must not write the stale mode back
+        let g = fs.create(d, "g").unwrap();
+        assert_eq!(
+            fs.stat(d).unwrap().mode,
+            0o700,
+            "out-of-band chmod survived a cached create"
+        );
+        assert_eq!(fs.lookup(d, "g").unwrap(), Some(g));
+
+        // remove the directory; its id is reclaimed and must not leak a resident
+        // entry into the reused inode.
+        fs.unlink(d, "f").unwrap();
+        fs.unlink(d, "g").unwrap();
+        fs.rmdir(root, "d").unwrap();
+        let reused = fs.mkdir(root, "e").unwrap();
+        assert_eq!(reused, d, "id recycled");
+        assert!(
+            fs.readdir(reused).unwrap().is_empty(),
+            "reused dir id must start empty (no stale cache)"
+        );
+
+        // toggling the cache off keeps everything resolvable.
+        fs.set_dir_cache(false);
+        assert_eq!(fs.lookup(root, "e").unwrap(), Some(reused));
     }
 
     #[test]
