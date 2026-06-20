@@ -200,6 +200,24 @@ impl Directory {
         true
     }
 
+    /// Link a name already known to be absent (e.g. when reloading a directory
+    /// from disk, where the persisted entries are guaranteed unique). Unlike
+    /// [`add`](Self::add) this skips the cross-segment duplicate scan and takes
+    /// the name by value, so a bulk rebuild costs one hash + one insert per
+    /// entry instead of an O(entries x segments) membership check.
+    pub fn push_unique(&mut self, name: String, inode: InodeId) {
+        let h = name_hash(&name);
+        for s in &mut self.segments {
+            if !s.full() {
+                s.add(h, name, inode);
+                return;
+            }
+        }
+        let mut s = Segment::new(self.cap, self.fp);
+        s.add(h, name, inode);
+        self.segments.push(s);
+    }
+
     /// Resolve name -> inode, scanning segments until a filter admits a hit.
     pub fn find(&self, name: &str) -> Option<InodeId> {
         let h = name_hash(name);
@@ -305,6 +323,30 @@ mod tests {
 
         // Duplicate Add is rejected.
         assert!(!d.add(&all[1], InodeId(99)), "duplicate Add accepted");
+    }
+
+    #[test]
+    fn push_unique_matches_add() {
+        // push_unique (the dup-scan-skipping bulk loader) must produce a
+        // directory indistinguishable from one built with add: same length,
+        // same segment growth, every name resolving to its inode.
+        let mut d = Directory::new();
+        let all = names(10_000); // forces multiple segments
+        for (i, n) in all.iter().enumerate() {
+            d.push_unique(n.clone(), InodeId(i as u64 + 1));
+        }
+        assert_eq!(d.len(), all.len());
+        assert!(d.segments() >= 3, "got {} segments", d.segments());
+        for (i, n) in all.iter().enumerate() {
+            assert_eq!(d.find(n), Some(InodeId(i as u64 + 1)), "Find({n})");
+        }
+        for i in 0..all.len() {
+            let n = format!("absent_{i:06}.dat");
+            assert!(d.find(&n).is_none(), "Find({n}) reported present");
+        }
+        // The result stays mutable through the normal API.
+        assert!(d.delete(&all[0]), "delete after push_unique");
+        assert!(!d.add(&all[1], InodeId(99)), "duplicate add accepted");
     }
 
     #[test]

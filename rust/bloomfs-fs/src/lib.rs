@@ -679,25 +679,57 @@ impl<D: Device> FS<D> {
         Ok(())
     }
 
+    /// Decode directory `id`'s pages into a flat entry list, without building the
+    /// Bloom index, page layout or `page_of` map. This is the read-only
+    /// counterpart to `open_dir`: the reader ops (lookup/readdir/...) only need
+    /// the entries, so they skip the per-entry name clone and the structures
+    /// that exist solely to support mutation + flush.
+    fn read_dir_pages(&self, id: u64) -> Result<Vec<DirEntry>> {
+        let in_ = self.inodes.get(id)?;
+        if in_.kind != TYPE_DIR {
+            return Err(Error::NotDir);
+        }
+        let blob = self.get_data(&in_)?;
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off < blob.len() {
+            let end = (off + DIR_PAGE_SIZE).min(blob.len());
+            let (entries, _used) = decode_dir_page(&blob[off..end])?;
+            out.extend(entries);
+            off += DIR_PAGE_SIZE;
+        }
+        Ok(out)
+    }
+
     // --- VFS operations ---
 
     /// Resolve `name` in directory `parent` to an inode id.
     pub fn lookup(&self, parent: u64, name: &str) -> Result<Option<u64>> {
-        let h = self.open_dir(parent)?;
-        Ok(h.dir.find(name).map(|i| i.0))
+        // A single resolve needs no Bloom index: decode the pages and scan them
+        // directly. Building the per-segment filters would cost a full pass over
+        // every name (plus the hashing) only to answer one query — a linear scan
+        // of the already-decoded entries is cheaper and touches the same data.
+        for e in self.read_dir_pages(parent)? {
+            if e.name == name {
+                return Ok(Some(e.inode.0));
+            }
+        }
+        Ok(None)
     }
 
     /// List the names in directory `id` (a one-shot consistent snapshot).
     pub fn readdir(&self, id: u64) -> Result<Vec<String>> {
-        let h = self.open_dir(id)?;
-        Ok(h.dir.list())
+        Ok(self
+            .read_dir_pages(id)?
+            .into_iter()
+            .map(|e| e.name)
+            .collect())
     }
 
     /// Return directory `id`'s entries (name + id + type) as one snapshot.
     pub fn readdirents(&self, id: u64) -> Result<Vec<Dirent>> {
-        let h = self.open_dir(id)?;
         let mut out = Vec::new();
-        for e in h.dir.entries() {
+        for e in self.read_dir_pages(id)? {
             let in_ = self.inodes.get(e.inode.0)?;
             out.push(Dirent {
                 name: e.name,
@@ -710,9 +742,12 @@ impl<D: Device> FS<D> {
 
     /// Capture a consistent snapshot of directory `id`'s names for iteration.
     pub fn open_dir_stream(&self, id: u64) -> Result<DirHandle> {
-        let h = self.open_dir(id)?;
         Ok(DirHandle {
-            entries: h.dir.list(),
+            entries: self
+                .read_dir_pages(id)?
+                .into_iter()
+                .map(|e| e.name)
+                .collect(),
             pos: 0,
         })
     }
