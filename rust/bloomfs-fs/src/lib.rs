@@ -177,10 +177,18 @@ pub struct FS<D: Device> {
     /// the structural index — the directory's own inode is re-read from the table
     /// on every checkout, so a `chmod`/`chown`/`utimes` on the directory id (which
     /// bypasses this cache) can never be clobbered by a later cached mutation.
-    dir_cache: Option<Mutex<HashMap<u64, CachedDir>>>,
+    /// Capped at `DIR_CACHE_CAP` entries; insertions evict the LRU victim so a
+    /// `find`-style traversal cannot OOM the process.
+    dir_cache: Option<Mutex<DirCache>>,
 }
 
 // --- directory page cache (one resident open directory) ---
+
+/// Maximum number of simultaneously resident directories.  A `find` on a
+/// filesystem with millions of subdirectories would otherwise load every
+/// `CachedDir` into RAM and OOM the process.  256 fits comfortably in a few
+/// MiB for typical directory sizes while covering almost all real working sets.
+const DIR_CACHE_CAP: usize = 256;
 
 /// A resident open directory: its in-memory Bloom-segmented index (the lookup
 /// authority) plus the page layout it persists to. The two are kept in sync
@@ -193,6 +201,52 @@ struct CachedDir {
     used: Vec<usize>,
     page_of: HashMap<String, usize>,
     dirty: HashSet<usize>,
+    /// Monotone tick set on every access — used to evict the LRU entry when the
+    /// cache is full.  Initialised to 0; updated by `DirCache::touch`.
+    lru_tick: u64,
+}
+
+/// LRU-capped directory cache.  Interior-mutable through `Mutex` so reader ops
+/// (`cache_peek`) can keep their `&self` signature.
+struct DirCache {
+    entries: HashMap<u64, CachedDir>,
+    tick: u64,
+}
+
+impl DirCache {
+    fn new() -> Self {
+        DirCache {
+            entries: HashMap::new(),
+            tick: 0,
+        }
+    }
+
+    /// Record an access to `id`, bumping its LRU tick.
+    fn touch(&mut self, id: u64) {
+        self.tick += 1;
+        if let Some(e) = self.entries.get_mut(&id) {
+            e.lru_tick = self.tick;
+        }
+    }
+
+    /// Insert `entry` for `id`, evicting the least-recently-used entry first if
+    /// the cache is already at capacity.
+    fn insert(&mut self, id: u64, mut entry: CachedDir) {
+        if self.entries.len() >= DIR_CACHE_CAP && !self.entries.contains_key(&id) {
+            // Find and remove the entry with the smallest lru_tick.
+            if let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, v)| v.lru_tick)
+                .map(|(k, _)| *k)
+            {
+                self.entries.remove(&victim);
+            }
+        }
+        self.tick += 1;
+        entry.lru_tick = self.tick;
+        self.entries.insert(id, entry);
+    }
 }
 
 impl CachedDir {
@@ -457,7 +511,7 @@ impl<D: Device> FS<D> {
             free_inodes,
             clock: Box::new(default_now),
             meta_buf,
-            dir_cache: Some(Mutex::new(HashMap::new())),
+            dir_cache: Some(Mutex::new(DirCache::new())),
         })
     }
 
@@ -478,7 +532,7 @@ impl<D: Device> FS<D> {
     /// affects correctness — the cache is a pure mirror of the in-RAM metadata.
     pub fn set_dir_cache(&mut self, on: bool) {
         self.dir_cache = if on {
-            Some(Mutex::new(HashMap::new()))
+            Some(Mutex::new(DirCache::new()))
         } else {
             None
         };
@@ -692,6 +746,7 @@ impl<D: Device> FS<D> {
             used: Vec::new(),
             page_of: HashMap::new(),
             dirty: HashSet::new(),
+            lru_tick: 0, // set by DirCache::insert / DirCache::touch on first use
         };
         let mut off = 0;
         while off < blob.len() {
@@ -716,7 +771,7 @@ impl<D: Device> FS<D> {
     /// (e.g. a `chmod`). A miss (or a disabled cache) falls back to a disk load.
     fn checkout_dir(&self, id: u64) -> Result<CachedDir> {
         if let Some(cache) = &self.dir_cache {
-            if let Some(mut h) = cache.lock().unwrap().remove(&id) {
+            if let Some(mut h) = cache.lock().unwrap().entries.remove(&id) {
                 h.in_ = self.inodes.get(id)?;
                 return Ok(h);
             }
@@ -726,6 +781,8 @@ impl<D: Device> FS<D> {
 
     /// Persist a working directory (its dirty pages) and, with the cache on, place
     /// it back into the resident map so the next access skips the disk reload.
+    /// The LRU-capped `DirCache::insert` evicts the least-recently-used entry if
+    /// the map is already at `DIR_CACHE_CAP`.
     fn commit_dir(&mut self, id: u64, mut h: CachedDir) -> Result<()> {
         self.flush_dir(id, &mut h)?;
         if let Some(cache) = &self.dir_cache {
@@ -738,7 +795,7 @@ impl<D: Device> FS<D> {
     /// or its id recycled). A no-op when the cache is off or the id is absent.
     fn evict_dir(&self, id: u64) {
         if let Some(cache) = &self.dir_cache {
-            cache.lock().unwrap().remove(&id);
+            cache.lock().unwrap().entries.remove(&id);
         }
     }
 
@@ -754,11 +811,13 @@ impl<D: Device> FS<D> {
             None => return Ok(None),
         };
         let mut g = cache.lock().unwrap();
-        if let std::collections::hash_map::Entry::Vacant(e) = g.entry(id) {
+        if !g.entries.contains_key(&id) {
             let h = self.load_dir(id)?;
-            e.insert(h);
+            g.insert(id, h);
+        } else {
+            g.touch(id);
         }
-        Ok(Some(f(g.get(&id).unwrap())))
+        Ok(Some(f(g.entries.get(&id).unwrap())))
     }
 
     /// Persist every page changed since load, each as one record-addressable
@@ -1908,5 +1967,45 @@ mod tests {
 
         // Zero-length is always OK.
         assert!(fs.fallocate(fs.root(), 0).is_ok());
+    }
+
+    /// The dir_cache is capped at DIR_CACHE_CAP entries: walking more directories
+    /// than the cap must not grow the cache beyond it (i.e. no OOM on `find`).
+    #[test]
+    fn dir_cache_lru_cap() {
+        let dev = MemDevice::new(8192);
+        let mut fs = FS::format(dev, None).unwrap();
+        fs.set_dir_cache(true);
+        let root = fs.root();
+
+        // Create DIR_CACHE_CAP + 10 subdirectories.
+        let n = DIR_CACHE_CAP + 10;
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = fs.mkdir(root, &format!("sub_{i:04}")).unwrap();
+            ids.push(id);
+        }
+        fs.commit().unwrap();
+
+        // Lookup every directory — this populates the cache via cache_peek.
+        for id in &ids {
+            fs.stat(*id).unwrap(); // touches inode; does not hit cache_peek
+            // A lookup inside the sub-dir forces a cache_peek on the sub-dir.
+            fs.lookup(*id, "nonexistent").unwrap();
+        }
+
+        // The cache must not exceed the cap.
+        let cache_size = fs
+            .dir_cache
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .entries
+            .len();
+        assert!(
+            cache_size <= DIR_CACHE_CAP,
+            "cache size {cache_size} exceeds cap {DIR_CACHE_CAP}"
+        );
     }
 }
