@@ -3,5 +3,9 @@
 version = 4
 
 [[package]]
+name = "bloomfs-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "bloomfs-block"
 version = "0.1.0"
