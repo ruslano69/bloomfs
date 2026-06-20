@@ -117,6 +117,20 @@ func (b *Bitmap) ApplyDeferred() {
 // Pending reports how many deferred-free ranges await ApplyDeferred.
 func (b *Bitmap) Pending() int { return len(b.deferred) }
 
+// DeferredCount reports the total number of clusters queued in deferred-free
+// ranges. These clusters are still counted as used in the bitmap (they cannot
+// be reallocated until after the next commit), but from the user's perspective
+// they are "about to be free" — StatFS adds this to Available() so that df does
+// not falsely report the filesystem as nearly full during a long write or
+// unlink loop.
+func (b *Bitmap) DeferredCount() uint64 {
+	var n uint64
+	for _, r := range b.deferred {
+		n += r.count
+	}
+	return n
+}
+
 func (b *Bitmap) Used() uint64      { return b.used }
 func (b *Bitmap) Available() uint64 { return b.total - b.used }
 func (b *Bitmap) Total() uint64     { return b.total }

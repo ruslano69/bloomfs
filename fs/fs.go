@@ -53,6 +53,7 @@ var (
 	ErrNotEmpty   = errors.New("fs: directory not empty")
 	ErrInvalid    = errors.New("fs: invalid argument")
 	ErrPermission = errors.New("fs: permission denied")
+	ErrNoSpace    = errors.New("fs: not enough space")
 )
 
 // Access mask bits, matching POSIX access(2) / the FUSE access opcode.
@@ -74,7 +75,7 @@ const (
 // exclusive write lock, so readers never race a writer.
 type FS struct {
 	mu     sync.RWMutex
-	dcache sync.Map // uint64 inode id -> *cachedDir (open-directory cache, §B11)
+	dcache *dirCache // bounded open-directory cache (§B11)
 
 	dev    block.Device
 	ub     *cow.Uberblock
@@ -183,6 +184,83 @@ func (h *cachedDir) markDirty(p int) {
 	h.dirty[p] = struct{}{}
 }
 
+// dirCacheCap bounds the resident open-directory cache (§B11). Without a bound,
+// a workload that touches a huge number of directories (e.g. a full-tree find)
+// pins every one in RAM until OOM. At the cap the least-recently-used entry is
+// evicted; a later access simply reloads it from disk. A few hundred dirs is a
+// few MiB of Bloom index — enough to keep a hot working set resident.
+const dirCacheCap = 256
+
+// dirCache is a bounded LRU over open directories. It carries its own mutex so
+// readers (which hold only f.mu.RLock) can still populate and reorder it
+// concurrently; a cachedDir's contents are mutated only under f.mu's write lock,
+// so readers never race a writer over a directory's actual bytes. Between
+// operations a cachedDir holds no unflushed state (every mutation flushes before
+// returning), so evicting one only forces a later reload — never data loss.
+type dirCache struct {
+	mu      sync.Mutex
+	entries map[uint64]*cachedDir
+	ticks   map[uint64]uint64 // inode id -> last-use tick, for LRU ordering
+	tick    uint64
+}
+
+func newDirCache() *dirCache {
+	return &dirCache{
+		entries: make(map[uint64]*cachedDir),
+		ticks:   make(map[uint64]uint64),
+	}
+}
+
+// load returns the cached directory for id, marking it most-recently-used.
+func (c *dirCache) load(id uint64) (*cachedDir, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	h, ok := c.entries[id]
+	if ok {
+		c.tick++
+		c.ticks[id] = c.tick
+	}
+	return h, ok
+}
+
+// loadOrStore returns the existing entry for id, or inserts h and returns it,
+// evicting the least-recently-used entry first if the cache is at capacity. This
+// mirrors sync.Map.LoadOrStore so two readers racing on a miss keep just one.
+func (c *dirCache) loadOrStore(id uint64, h *cachedDir) *cachedDir {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if existing, ok := c.entries[id]; ok {
+		c.tick++
+		c.ticks[id] = c.tick
+		return existing
+	}
+	if len(c.entries) >= dirCacheCap {
+		victim, min, first := uint64(0), uint64(0), true
+		for k, t := range c.ticks {
+			if first || t < min {
+				victim, min, first = k, t, false
+			}
+		}
+		if !first {
+			delete(c.entries, victim)
+			delete(c.ticks, victim)
+		}
+	}
+	c.tick++
+	c.ticks[id] = c.tick
+	c.entries[id] = h
+	return h
+}
+
+// remove drops id from the cache (e.g. when its inode is reclaimed) so a reused
+// id can never alias a stale directory.
+func (c *dirCache) remove(id uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, id)
+	delete(c.ticks, id)
+}
+
 // Format creates a fresh filesystem on dev and returns it mounted. A nil key
 // selects a plaintext pool (§5.5 opt-out); otherwise key is the AES-XTS key.
 func Format(dev block.Device, key []byte) (*FS, error) {
@@ -224,6 +302,7 @@ func Mount(dev block.Device, key []byte) (*FS, error) {
 		ddt:        ddt,
 		inodes:     inodes,
 		bs:         bs,
+		dcache:     newDirCache(),
 		openCount:  make(map[uint64]uint32),
 		freeInodes: rebuildFreeInodes(inodes),
 		clock:      func() uint64 { return uint64(time.Now().UnixNano()) },
@@ -378,6 +457,24 @@ func (f *FS) loadRefs(in *inode.Inode) ([]store.Ref, error) {
 // storeRefs records refs as the inode's block map and sets Size/RecordSizeLog2.
 // Zero refs clear the data; one ref goes inline; many refs are written as a
 // block-map blob whose own ref is stored inline. Caller releases any prior data.
+// bsWrite stores one record through the block store, with a single auto-commit
+// retry: if the allocator is full but deferred-free ranges are pending, an
+// immediate commit drains them (cow.Commit calls bm.ApplyDeferred) and frees
+// space for the retry. This keeps workloads that unlink in a loop — e.g. "keep
+// only the last N archives" — from hitting a spurious ENOSPC, since deferred
+// frees otherwise accumulate until a commit that may never come on its own. The
+// caller holds the write lock.
+func (f *FS) bsWrite(plaintext []byte) (store.Ref, error) {
+	r, err := f.bs.Write(plaintext)
+	if errors.Is(err, alloc.ErrNoSpace) && f.bm.Pending() > 0 {
+		if cerr := f.commitLocked(); cerr != nil {
+			return store.Ref{}, cerr
+		}
+		return f.bs.Write(plaintext)
+	}
+	return r, err
+}
+
 func (f *FS) storeRefs(in *inode.Inode, refs []store.Ref, size uint64, log2 uint8) error {
 	in.BlockMap = [64]byte{}
 	in.Flags &^= inode.FlagInlineExtents
@@ -391,7 +488,7 @@ func (f *FS) storeRefs(in *inode.Inode, refs []store.Ref, size uint64, log2 uint
 		copy(in.BlockMap[:store.RefSize], refs[0].Marshal())
 		in.Flags |= inode.FlagInlineExtents
 	default:
-		mapRef, err := f.bs.Write(encodeRefs(refs))
+		mapRef, err := f.bsWrite(encodeRefs(refs))
 		if err != nil {
 			return err
 		}
@@ -484,16 +581,15 @@ func (f *FS) getData(in *inode.Inode) ([]byte, error) {
 // first access (so a hot Lookup is a RAM hit, not a disk read + decrypt +
 // decompress + rebuild). Caller holds f.mu (read or write).
 func (f *FS) openDir(id uint64) (*cachedDir, error) {
-	if v, ok := f.dcache.Load(id); ok {
-		return v.(*cachedDir), nil
+	if h, ok := f.dcache.load(id); ok {
+		return h, nil
 	}
 	h, err := f.loadDirFromDisk(id)
 	if err != nil {
 		return nil, err
 	}
-	// Two concurrent readers may both load on a miss; LoadOrStore keeps one.
-	actual, _ := f.dcache.LoadOrStore(id, h)
-	return actual.(*cachedDir), nil
+	// Two concurrent readers may both load on a miss; loadOrStore keeps one.
+	return f.dcache.loadOrStore(id, h), nil
 }
 
 // loadDirFromDisk reads a directory inode and rebuilds both its Bloom-segmented
@@ -632,13 +728,52 @@ func (f *FS) StatFS() FSStat {
 	defer f.mu.RUnlock()
 	used := f.ub.NextInode - uint64(len(f.freeInodes))
 	cap := f.inodes.Cap()
+	// Available() excludes deferred-free clusters (they stay SET in the bitmap
+	// until the next commit so a crash cannot reuse them). Adding DeferredCount()
+	// gives the user-visible "free" figure: space that is either already free or
+	// will be freed atomically at the next commit. Without this, df over-reports
+	// usage during a long write/unlink loop and can trigger spurious "disk full".
 	return FSStat{
 		BlockSize:  block.Size,
 		Blocks:     f.bm.Total(),
-		BlocksFree: f.bm.Available(),
+		BlocksFree: f.bm.Available() + f.bm.DeferredCount(),
 		Files:      cap,
 		FilesFree:  cap - used,
 	}
+}
+
+// Fallocate reports whether length more bytes of data could fit right now,
+// returning ErrNoSpace if not (the fast-fail a fallocate(2) caller wants instead
+// of discovering ENOSPC mid-write). BloomFS is content-addressed, so we cannot
+// reserve physical clusters for data that has not been written yet (unknown
+// hash → unknown dedup ratio); instead we estimate the worst case — 0% dedup,
+// all data unique — and compare against the free-block count, which already
+// includes deferred-free clusters. A pass means length bytes definitely could
+// fit; a failure means they definitely will not, even with perfect dedup. The
+// inode's existing data is not counted: fallocate asks "is there room for length
+// more bytes", not "is the whole file free".
+//
+// Overhead for length bytes: ceil(length/recordSize) data records (each record
+// is recordSize/BlockSize clusters), plus one RefSize block-map entry per
+// record, rounded up to whole clusters.
+func (f *FS) Fallocate(id uint64, length uint64) error {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if length == 0 {
+		return nil
+	}
+	recordSize, _ := recordSizeFor(length)
+	clustersPerRec := recordSize / block.Size
+	nRecords := (length + recordSize - 1) / recordSize
+	dataClusters := nRecords * clustersPerRec
+	mapBytes := nRecords * uint64(store.RefSize)
+	mapClusters := (mapBytes + block.Size - 1) / block.Size
+	needed := dataClusters + mapClusters
+	free := f.bm.Available() + f.bm.DeferredCount()
+	if needed > free {
+		return ErrNoSpace
+	}
+	return nil
 }
 
 // Access reports whether the caller (uid/gid plus supplementary gids) may access
@@ -1039,7 +1174,7 @@ func (f *FS) writeAtLocked(id uint64, in *inode.Inode, off uint64, data []byte) 
 		if lo < hi {
 			copy(rec[lo-recStart:], data[lo-off:hi-off])
 		}
-		r, err := f.bs.Write(rec)
+		r, err := f.bsWrite(rec)
 		if err != nil {
 			return err
 		}
@@ -1176,7 +1311,7 @@ func (f *FS) reclaim(id uint64, in *inode.Inode) error {
 	if err := f.releaseData(in); err != nil {
 		return err
 	}
-	f.dcache.Delete(id) // drop any cached directory so a reused id can't alias it
+	f.dcache.remove(id) // drop any cached directory so a reused id can't alias it
 	// Zero the slot but carry a bumped generation forward, then make the id
 	// available for reuse (§F5).
 	if err := f.inodes.Put(id, &inode.Inode{Generation: in.Generation + 1}); err != nil {
@@ -1192,8 +1327,7 @@ func (f *FS) reclaim(id uint64, in *inode.Inode) error {
 // silently overwritten by a subsequent directory write (and vice versa). Caller
 // holds the write lock.
 func (f *FS) mutateInode(id uint64, fn func(*inode.Inode)) error {
-	if v, ok := f.dcache.Load(id); ok {
-		h := v.(*cachedDir)
+	if h, ok := f.dcache.load(id); ok {
 		fn(h.in)
 		return f.inodes.Put(id, h.in)
 	}
@@ -1266,6 +1400,40 @@ func (f *FS) Link(parent uint64, name string, targetID uint64) error {
 	return f.flushDir(parent, h)
 }
 
+// dirSubtreeContains reports whether target lies anywhere in the directory
+// subtree rooted at root (inclusive). Rename uses it to reject moving a
+// directory into one of its own descendants — that would splice the subtree out
+// of the namespace, leaking every inode and block it holds forever (POSIX
+// requires EINVAL). BloomFS stores no parent back-pointer, so we cannot walk up
+// from target; instead we walk down from root with an explicit stack (iterative
+// DFS, so a deep tree cannot blow the Go stack). Only directories are pushed, so
+// the traversal is bounded by the directory count under root, not total files.
+// Caller holds the write lock.
+func (f *FS) dirSubtreeContains(root, target uint64) (bool, error) {
+	stack := []uint64{root}
+	for len(stack) > 0 {
+		d := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if d == target {
+			return true, nil
+		}
+		h, err := f.openDir(d)
+		if err != nil {
+			return false, err
+		}
+		for _, e := range h.dir.Entries() {
+			in, err := f.inodes.Get(uint64(e.Inode))
+			if err != nil {
+				return false, err
+			}
+			if in.Type == inode.TypeDir { // recurse only into directories
+				stack = append(stack, uint64(e.Inode))
+			}
+		}
+	}
+	return false, nil
+}
+
 // Rename moves srcName in srcParent to dstName in dstParent. If dstName already
 // exists it is atomically replaced (its link count drops, reclaimed if it hits
 // zero, §E1/§E2). Atomicity holds across Commit/Fsync: after a successful
@@ -1288,10 +1456,30 @@ func (f *FS) Rename(srcParent uint64, srcName string, dstParent uint64, dstName 
 	if err != nil {
 		return err
 	}
-	// Reject the trivial directory loop: moving a directory into itself. (A
-	// deeper loop — into its own descendant — is not yet guarded; see SPEC §F note.)
+	// Reject the trivial directory loop: moving a directory into itself.
 	if dstParent == uint64(id) {
 		return ErrInvalid
+	}
+	// Reject the deeper loop: moving a directory into one of its own descendants
+	// (e.g. mv /a /a/b/c). That would detach the subtree from the root —
+	// unreachable, un-rmdir-able, a permanent inode/block leak (POSIX EINVAL).
+	// Only a directory can form such a cycle, and only across different parents
+	// (within one directory a rename never changes ancestry), so the costly walk
+	// is skipped otherwise.
+	if srcParent != dstParent {
+		moved, err := f.inodes.Get(uint64(id))
+		if err != nil {
+			return err
+		}
+		if moved.Type == inode.TypeDir {
+			contains, err := f.dirSubtreeContains(uint64(id), dstParent)
+			if err != nil {
+				return err
+			}
+			if contains {
+				return ErrInvalid
+			}
+		}
 	}
 
 	// Overwrite: drop the existing destination's link first.

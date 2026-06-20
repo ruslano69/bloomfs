@@ -98,6 +98,8 @@ func errno(err error) syscall.Errno {
 		return syscall.ENOTEMPTY
 	case errors.Is(err, bloomfs.ErrNoInodes):
 		return syscall.ENOSPC
+	case errors.Is(err, bloomfs.ErrNoSpace):
+		return syscall.ENOSPC
 	case errors.Is(err, bloomfs.ErrInvalid):
 		return syscall.EINVAL
 	case errors.Is(err, bloomfs.ErrNotFile):
@@ -385,6 +387,20 @@ func (n *bnode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) syscal
 	return errno(n.bfs.Fsync())
 }
 
+// Allocate handles fallocate(2). We don't physically pre-reserve clusters (the
+// store is content-addressed, so space for unwritten data can't be pinned), but
+// we honor the space check so a caller using fallocate to reserve room fails
+// early with ENOSPC instead of mid-write. Only mode 0 ("ensure space for
+// [off, off+size) and extend size if needed") is supported; any flag
+// (FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, …) means semantics we can't
+// provide, so we return ENOTSUP and the kernel/libc falls back to emulation.
+func (n *bnode) Allocate(ctx context.Context, f fs.FileHandle, off, size uint64, mode uint32) syscall.Errno {
+	if mode != 0 {
+		return syscall.ENOTSUP
+	}
+	return errno(n.bfs.Fallocate(n.id, size))
+}
+
 // Compile-time guarantees that bnode satisfies every kernel op the binding wires.
 var (
 	_ fs.NodeLookuper   = (*bnode)(nil)
@@ -405,6 +421,7 @@ var (
 	_ fs.NodeReader     = (*bnode)(nil)
 	_ fs.NodeWriter     = (*bnode)(nil)
 	_ fs.NodeFsyncer    = (*bnode)(nil)
+	_ fs.NodeAllocater  = (*bnode)(nil)
 
 	_ fs.FileReader   = (*bfile)(nil)
 	_ fs.FileWriter   = (*bfile)(nil)
