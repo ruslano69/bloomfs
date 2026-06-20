@@ -143,6 +143,9 @@ doubles as an end-to-end integrity check on read.
 - The full design specification (Russian) is in [docs/SPEC.md](docs/SPEC.md) and
   drives the staged implementation — including the resolved decisions on
   Copy-on-Write, deduplication, recordsize, and compression/encryption modes.
+- The architecture and on-disk format are now **frozen** (SPEC §E10); the Rust
+  port is planned in [docs/PORTING.md](docs/PORTING.md) — layer-by-layer order,
+  crate mapping, the bloom-library split, and the deferred-optimization backlog.
 
 ## Build & test
 
