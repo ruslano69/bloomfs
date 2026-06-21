@@ -235,3 +235,73 @@ func TestAdaptiveDeleteInFlatMode(t *testing.T) {
 		}
 	}
 }
+
+// --- Global filter correctness tests (Phase P0, globalfilter package) ---
+//
+// These tests describe the required behaviour of the GlobalFilter component.
+// They live here as a spec; move to globalfilter/filter_test.go when the
+// package exists.
+
+// TestGlobalFilterDeleteThenRecreate is the critical correctness case:
+// delete a name, then re-create it with the same name in the same directory.
+// The file must be findable immediately after re-creation — no ENOENT.
+//
+// Dangerous sub-case: if rebuild() fired between the Unlink and the Create
+// (removing the key from the Bloom filter entirely), the Create must still
+// re-add the key to the filter before making the entry visible to readers.
+func TestGlobalFilterDeleteThenRecreate(t *testing.T) {
+	t.Skip("Phase P0 not yet implemented: globalfilter package missing")
+
+	// Sequence: create → delete → create → must find.
+	//
+	// var gf globalfilter.GlobalFilter
+	// const dirIno = 42
+	// gf.Create(dirIno, "foo", 1)
+	// gf.Unlink(dirIno, "foo")
+	// gf.Create(dirIno, "foo", 2)   // re-create: same name, new inode
+	//
+	// result := gf.Lookup(dirIno, "foo")
+	// if result == globalfilter.Absent {
+	//     t.Fatal("file not found after delete+recreate: tombstone not cleared")
+	// }
+}
+
+// TestGlobalFilterRebuildThenRecreate covers the dangerous sub-case:
+// rebuild fires AFTER Unlink (removing the key from the filter), then Create
+// must re-add it before the entry is visible.
+func TestGlobalFilterRebuildThenRecreate(t *testing.T) {
+	t.Skip("Phase P0 not yet implemented: globalfilter package missing")
+
+	// Sequence: create → delete → trigger rebuild → create → must find.
+	//
+	// var gf globalfilter.GlobalFilter
+	// const dirIno = 42
+	// gf.Create(dirIno, "foo", 1)
+	// gf.Unlink(dirIno, "foo")
+	// gf.ForceRebuild()             // simulates hitting RebuildThreshold
+	// gf.Create(dirIno, "foo", 2)
+	//
+	// result := gf.Lookup(dirIno, "foo")
+	// if result == globalfilter.Absent {
+	//     t.Fatal("file not found after rebuild+recreate: filter not updated")
+	// }
+}
+
+// TestGlobalFilterCreateOrderingGuarantee documents the required step order
+// inside Create: tombstone must be cleared and filter must be updated BEFORE
+// the directory entry becomes visible. Verified via the global filter API,
+// not via internal state inspection.
+func TestGlobalFilterCreateOrderingGuarantee(t *testing.T) {
+	t.Skip("Phase P0 not yet implemented: globalfilter package missing")
+
+	// After gf.Create() returns, Lookup must never return Absent for that key.
+	// This is the invariant; the internal ordering (steps 1→2→3) is what
+	// enforces it. If any caller sees Absent after a successful Create, the
+	// ordering contract was violated.
+	//
+	// var gf globalfilter.GlobalFilter
+	// gf.Create(42, "bar", 99)
+	// if gf.Lookup(42, "bar") == globalfilter.Absent {
+	//     t.Fatal("invariant violated: Lookup returned Absent after Create")
+	// }
+}

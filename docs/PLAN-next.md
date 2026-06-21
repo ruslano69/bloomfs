@@ -38,27 +38,65 @@ key = xxh3(dir_inode_id ‖ name)   ← scoped per directory, globally unique
 GlobalFilter:
     filter  BlockedFilter          // covers all live (dir, name) pairs
     deleted map[uint64]struct{}    // exact tombstone set for deleted entries
+```
 
-Lookup(dir_inode, name):
-    k = key(dir_inode, name)
-    if !filter.Test(k)  → ENOENT  // Bloom guarantees absence
-    if k ∈ deleted      → ENOENT  // precise negative knowledge
-    → do the actual directory map lookup
+**Lookup** (read-lock):
+```
+k = key(dir_inode, name)
+if !filter.Test(k)  → ENOENT   // Bloom guarantees absence
+if k ∈ deleted      → ENOENT   // precise: file was deleted, not yet rebuilt
+→ MAYBE: do the actual directory map lookup
+```
 
-Create(dir_inode, name):
-    k = key(dir_inode, name)
-    delete(deleted, k)             // handle re-create after delete
-    filter.Add(k)
+**Create** (write-lock) — order is critical:
+```
+k = key(dir_inode, name)
+1. delete(deleted, k)    // remove tombstone FIRST — must happen before dir.Add
+2. filter.Add(k)         // add to filter BEFORE the entry appears in directory
+3. dir.Add(name, inode)  // only now make the entry visible to readers
+```
+Why this order: a Lookup under read-lock can interleave after step 3.
+At that point steps 1 and 2 are already done — tombstone is gone, filter
+admits the key. If we did dir.Add first, a Lookup could see the entry in
+the directory but find `k ∈ deleted` and wrongly return ENOENT.
 
-Unlink(dir_inode, name):
-    k = key(dir_inode, name)
-    deleted[k] = struct{}{}
-    if len(deleted) >= RebuildThreshold { rebuild() }
+**Unlink** (write-lock) — symmetric:
+```
+k = key(dir_inode, name)
+1. dir.Delete(name)       // remove from directory FIRST
+2. deleted[k] = struct{}{} // then record tombstone
+if len(deleted) >= RebuildThreshold { rebuild() }
+```
+Why this order: after dir.Delete, no reader can find the entry in the
+directory. The tombstone in step 2 plugs the stale Bloom bits so future
+Lookups don't chase a ghost.
 
+**Rebuild-then-Create race** — the dangerous case:
+```
+Create("foo") → filter has key_foo, deleted={}
+Unlink("foo") → deleted={key_foo}
+...16 000 other deletions → rebuild() → key_foo REMOVED from filter, deleted={}
+Create("foo") →
+  step 1: delete(deleted, key_foo)  [no-op, already empty]
+  step 2: filter.Add(key_foo)       ← MUST happen before step 3
+  step 3: dir.Add("foo", inode)
+```
+If step 3 happened before step 2, a concurrent Lookup between steps 3 and 2
+would see: filter.Test → **false** (rebuild removed it, Add not yet done) →
+ENOENT — wrong answer, file is in the directory.
+The write-lock makes this impossible in practice, but the documented ordering
+makes correctness obvious without relying on lock reasoning alone.
+
+**Rebuild:**
+```
 rebuild():
-    scan all live directory entries from the inode table
-    build a fresh filter from scratch
-    deleted = map[uint64]struct{}{}   // reset tombstone set
+    new_filter = BlockedFilter sized for current live entry count
+    for each dir in filesystem:          // scan inode table (in RAM)
+        for each entry in dir.index:
+            new_filter.Add(key(dir.inode_id, entry.name))
+    filter  = new_filter
+    deleted = map[uint64]struct{}{}      // reset tombstone set
+```
 ```
 
 **Why `deleted` is better than a counting filter:**
