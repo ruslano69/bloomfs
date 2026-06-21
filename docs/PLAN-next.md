@@ -112,6 +112,7 @@ run the cycle check in both directions.
 | A | parent for `..` (Rust → Go) | 1.5–2 h |
 | B | renameat2 flags (FS → binding, Rust → Go) | 2–3 h |
 | C | parity, runs, 2 commits | 1 h |
+| D | commit dispatcher (dirty threshold + last-writer-close + idle timer) | 3.5 h |
 
 Do **A → B** (EXCHANGE relies on A's parent tracking). Rust first (flagship),
 then port to Go in one sitting.
@@ -119,6 +120,98 @@ then port to Go in one sitting.
 **Main risk to keep in mind:** the temptation to put parent on disk. Don't — that
 is a 128-byte format migration just for `..`; the cost is disproportionate. RAM
 tracking at the binding closes it cleanly.
+
+---
+
+## Phase D — commit dispatcher (durability without false promises)
+
+**Problem:** currently a `Commit` happens only on explicit `fsync(2)` or clean
+unmount. `close(fd)` is a no-op (`Flush` returns 0). A hard crash between the
+last write and the next `fsync`/`umount` loses everything written since the last
+commit — window is unbounded.
+
+Time-based background commits (`commit=5s` à la ext4) are the wrong unit: one
+file that is half the disk is one "change" regardless of elapsed time. Count of
+mutations is equally meaningless. The right unit is **signals the filesystem can
+actually observe**.
+
+### Three signals, in priority order
+
+**Signal 1 — dirty-bytes threshold (strongest)**
+Track `dirtyBytes uint64` on the `FS` struct: increment by the number of bytes
+written on every `WriteAt`/`Append`. When `dirtyBytes` exceeds a configurable
+threshold (default 64 MiB), trigger a `Commit` synchronously before returning
+from the write call. Reset to 0 after every `Commit`.
+- No goroutine needed. No race — already inside the write-lock.
+- Prevents unbounded RAM growth. Covers streaming writers that never `fsync`.
+
+**Signal 2 — last writer closes (semantic)**
+Track `writeOpens int` per inode (or globally as a count of handles opened with
+write intent). Increment in `Open`/`Create` when `flags` include `O_WRONLY` or
+`O_RDWR`. Decrement in `Handle.Close()`. When `writeOpens` reaches 0 (and at
+least one write happened since the last commit), trigger `Commit`.
+- Closest to "the application said I'm done" without requiring explicit `fsync`.
+- Does not help long-lived writers (SQLite, databases keep the file open
+  continuously) — but for those, the application is expected to call `fsync`.
+
+**Signal 3 — write-inactivity timer (weakest, opt-in)**
+A background goroutine/thread wakes every `T` (mount option, default disabled).
+If `dirtyBytes > 0` and the last write was more than `T` ago, `Commit`. This
+covers burst workloads that pause naturally but never close the file.
+- Requires a goroutine and a timestamp (`lastWriteAt time.Time`).
+- Off by default; enabled with `-commit-idle=500ms` or similar mount option.
+- Least reliable of the three: a streaming writer has no idle window.
+
+### What this does NOT claim to solve
+A complex structure (database, VM image) spread across multiple files or with
+internal consistency invariants — only the application knows when its data is
+in a consistent state. The dispatcher solves the "forgot to fsync, power died"
+case, not the "half-written B-tree" case. Document this explicitly.
+
+### Implementation sketch
+
+```
+FS struct additions:
+  dirtyBytes  uint64        // reset on every Commit
+  writeOpens  int           // count of write-intent handles currently open
+  lastWriteAt time.Time     // for idle timer (only if enabled)
+
+DirtyThreshold = 64 << 20  // 64 MiB default, overridable via mount option
+
+on WriteAt / Append (already under write-lock):
+  dirtyBytes += bytesWritten
+  lastWriteAt = now()
+  if dirtyBytes >= DirtyThreshold { Commit(); dirtyBytes = 0 }
+
+on Open/Create with O_WRONLY|O_RDWR:
+  writeOpens++
+
+on Handle.Close() (already under lock):
+  if handle.writable { writeOpens-- }
+  if writeOpens == 0 && dirtyBytes > 0 { Commit(); dirtyBytes = 0 }
+
+background goroutine (opt-in):
+  ticker := time.NewTicker(idleInterval)
+  for range ticker.C {
+      if dirtyBytes > 0 && time.Since(lastWriteAt) >= idleInterval {
+          fs.mu.Lock(); Commit(); dirtyBytes = 0; fs.mu.Unlock()
+      }
+  }
+```
+
+Rust mirrors this exactly. Signal 1 and 2 are always on; Signal 3 is a
+`--commit-idle=<duration>` CLI flag passed through mount options.
+
+### Estimate
+
+| Step | What | Est. |
+|------|------|-------|
+| D1 | dirty-bytes threshold (Go + Rust) | 1 h |
+| D2 | last-writer-close (Go + Rust) | 1 h |
+| D3 | idle timer, mount option, tests | 1.5 h |
+
+Do D1 → D2 → D3. Each is independently shippable; stop after D2 if D3 feels
+like over-engineering for now.
 
 ---
 
