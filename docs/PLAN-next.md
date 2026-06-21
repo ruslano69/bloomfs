@@ -215,6 +215,121 @@ like over-engineering for now.
 
 ---
 
+## Phase E — lean FUSE layer + real-world validation
+
+**Goal:** before touching the kernel, prove the filesystem is production-reliable
+under real workloads. FUSE is the safety net — a bug here crashes the daemon, not
+the kernel. This phase generates the benchmark baseline that makes the eventual
+kernel-module comparison meaningful.
+
+### E1 — strip FUSE abstraction overhead
+
+Current `fuser`/`go-fuse` wrappers are correct but not optimal. Replace the
+request/response loop with a direct `/dev/fuse` reader that uses:
+- **io_uring** (Linux 5.19+): submit FUSE requests and responses through the
+  io_uring ring instead of `read`/`write` on the fd. Eliminates one syscall round
+  trip per operation; cuts context-switch overhead roughly in half.
+- **Multithreaded dispatch**: a pool of N worker threads each reads from the same
+  `/dev/fuse` fd (kernel serialises; workers pick up ops concurrently). Today a
+  single-threaded handler serialises all ops.
+- **Splice for data reads**: `splice(fuse_fd → pipe → splice → caller)` for read
+  responses skips a kernel→user→kernel copy on the data path.
+
+Rust first (replace `fuser` internals or write a thin shim on top). Go second
+(go-fuse already allows custom session loops — plug in the io_uring path).
+
+This does not change any filesystem logic. It only makes the FUSE channel faster
+so benchmark numbers reflect BloomFS, not the wrapper.
+
+### E2 — workload suite
+
+Run on a real mount (tmpfs-backed image for speed, file-backed for persistence):
+
+| Workload | What it stresses | Pass criterion |
+|----------|-----------------|----------------|
+| `fio --rw=randrw --bs=4k` | small-block random I/O, dedup path | no errors, data verified |
+| `fio --rw=write --bs=1m` | large sequential, compression path | throughput ≥ baseline |
+| `git clone linux` + `git checkout` | million-file lookup, Bloom filter | correct, no stalls |
+| SQLite WAL workload (100k inserts) | fsync contract, last-writer-close | no corruption on re-open |
+| `cp -r` large tree + remount + diff | persistence across unmount | byte-identical |
+| 32-thread concurrent create/unlink | race detector, dcache under pressure | zero races under `-race` |
+
+Record numbers. These become the baseline for the kernel-module comparison.
+
+### E3 — crash injection
+
+Simulate hard crash at random points:
+
+1. Mount image, start workload.
+2. `SIGKILL` the daemon (not `SIGTERM` — no clean unmount, no final commit).
+3. Remount.
+4. Verify: (a) filesystem mounts without error; (b) all files that received a
+   successful `fsync` before the kill are byte-identical; (c) files with no
+   `fsync` may be absent or have previous committed content — both are correct;
+   (d) no inode leaks (`df -i` before and after workload should balance).
+
+Automate as a script: 100 kill-cycles, report any violation. This is the
+durability contract test.
+
+### E4 — ext4 comparison
+
+Same workloads on ext4 (same hardware, same image size, `mount -t ext4`).
+Report as a ratio: `bloomfs_fuse / ext4`. FUSE overhead is ~20–40 % on metadata-
+heavy workloads; document it explicitly so the kernel-module comparison later can
+subtract it and show the real algorithm cost.
+
+---
+
+## Stage G — kernel module (final perspective)
+
+Native Linux VFS module: BloomFS registers as a `file_system_type`, mounts on a
+real block device, appears in `lsblk`/`blkid` as `bloomfs`, no FUSE in the path.
+
+**Why Rust makes this viable:** Linux kernel Rust support (`kernel::fs`,
+`kernel::block`, `kernel::sync`) is available since 6.1. A Go kernel module is
+not possible; the Rust port is the prerequisite.
+
+**Layer mapping:**
+
+| Current Rust crate | Kernel replacement |
+|--------------------|-------------------|
+| `bloomfs-block` (FileDevice) | `kernel::block` — bio submission, block_device |
+| `bloomfs-fuse` | `kernel::fs` — SuperBlockOperations, InodeOperations, FileOperations |
+| `bloomfs-store` (zstd, aes, blake3) | kernel crypto API: crypto_skcipher, crypto_acomp, crypto_shash |
+| `std::sync::RwLock` | `kernel::sync::RwLock` |
+| Rust allocator | `kernel::alloc` |
+
+**What does NOT change:** `bloomfs-bloom`, `bloomfs-dir`, `bloomfs-alloc`,
+`bloomfs-inode`, `bloomfs-dedup`, `bloomfs-cow`, `bloomfs-fs` — the entire
+algorithm core is untouched. Only the I/O and VFS integration layer changes.
+
+**Page cache integration** (`address_space_operations`: `readpage`, `writepage`,
+`writepages`) is the hardest part and the biggest performance win — this is what
+makes the kernel module comparable to ext4 rather than FUSE.
+
+**Gate:** do not start Stage G until Phase E3 (crash injection) is green. A
+kernel module with a reliability bug is a kernel panic, not a daemon crash.
+
+**Comparison deliverable:** `fio`/`git`/`sqlite` on native BloomFS vs ext4, same
+hardware, same kernel, no FUSE in either path. This is the number the project
+exists to produce.
+
+---
+
+## Updated order & estimate
+
+| Phase | What | Est. |
+|-------|------|------|
+| 0 | Recon + baseline | 0.5 h |
+| A | `..` parent tracking | 1.5–2 h |
+| B | `renameat2` flags | 2–3 h |
+| C | Parity, runs, commits | 1 h |
+| D | Commit dispatcher | 3.5 h |
+| E | Lean FUSE + validation suite | 1–2 weeks |
+| G | Kernel module | months; gate on E3 green |
+
+---
+
 ## Status going in
 
 All five prior fixes are at Rust↔Go parity, tests green under `-race`, pushed:
