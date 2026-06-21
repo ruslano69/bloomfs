@@ -10,104 +10,112 @@
 
 ---
 
-## Priority 0 — adaptive directory mode (restructure first)
+## Priority 0 — global Bloom filter + deletion map (restructure first)
 
-**Problem:** every directory, even one with 3 files, currently carries a Bloom
-filter and segmented structure. This is overhead on the common case (small
-directories) for the benefit of the rare case (large directories). Real-world
-statistics show directories with >10 000 files are rare — and rare precisely
-because existing filesystems make them painful. BloomFS should fix the pain, not
-impose the cure on everyone.
-
-**Precedent:** ext4 does exactly this — new directories start as a flat linear
-list and convert to HTree (hash tree) only when they exceed a threshold. This is
-established practice.
-
-**Benchmark evidence** (16 000-file directory, Go, Xeon 2.80 GHz):
-```
-cap=1000  (16 segments): miss=458 ns, hit=260 ns
-cap=4000  ( 4 segments): miss=123 ns, hit=105 ns
-cap=16000 ( 1 segment):  miss= 38 ns, hit= 69 ns
-```
-A Go map on a 50-entry directory: ~20–30 ns miss — **faster than any segmented
-mode**. The Bloom filter pays off somewhere around 500–2000 entries; below that
-it adds latency and memory for zero gain.
-
-### Design
+**Finding:** `BenchmarkFlatVsSegmented` (Xeon 2.80 GHz) shows a plain Go map
+beats the Bloom-segmented structure at every measured size up to 10 000 entries:
 
 ```
-directory created
-    │
-    ▼
-FLAT mode: map[xxh3(name)]→[]dirEntry
-  – no filter, no segments
-  – one map, minimum allocations
-  – lookup: one xxh3 + one map probe → ~20 ns
-    │
-    │  len(flat) >= FlatThreshold (TBD by benchmark, ~500)
-    ▼
-convertToSegmented()   ← one-way, triggered on Add()
-    │
-    ▼
-SEGMENTED mode: current Bloom-segment chain
-  – Bloom filter per segment, XXH3-keyed
-  – engages only where it earns its keep
+n=500   flat/miss=26 ns   segmented/miss=38 ns   (+46% for segmented)
+n=2000  flat/miss=30 ns   segmented/miss=38 ns   (+27% for segmented)
+n=10000 flat/miss=35 ns   segmented/miss=48 ns   (+37% for segmented)
 ```
 
-**On-disk representation:** the `Flags uint8` byte in the 128-byte inode has
-free bits. Add `FlagDirSegmented = 0x08` (or next free bit). Flat directories
-serialize as a plain key→inode list with no filter bytes; segmented directories
-serialize as today. The format is self-describing — no migration needed for
-existing images (they were always segmented; flat is new, opt-in by size).
+**Conclusion:** the per-directory Bloom filter is the wrong granularity.
+A per-directory filter must be sized for that directory's population; for the
+common case (small directories) it sits mostly empty and still costs one extra
+indirection. The filter only wins when it is large enough to be dense and compact
+relative to the map's bucket array — which happens at the filesystem scale,
+not the directory scale.
 
-**FlatThreshold:** must be determined by benchmark, not guessed. Add
-`BenchmarkFlatVsSegmented` that measures a pure `map`-only lookup (no filter)
-vs the current segmented path at counts 50, 100, 200, 500, 1000, 2000. The
-crossover point becomes `FlatThreshold`. Likely 200–500.
+**New design: one global filter for the entire filesystem.**
 
-### Implementation
+### How it works
 
-**Go (`dir` package):**
-- `Directory` struct gains a `flat map[uint64][]dirEntry` field (nil when
-  segmented).
-- `Add`: if `flat != nil`, insert into flat map; if `len(flat) >= FlatThreshold`
-  call `convertToSegmented()` and nil out `flat`.
-- `Find`: if `flat != nil`, one map probe; otherwise existing segment-chain path.
-- `List`, `Remove`: flat path is trivial; Remove in flat mode just deletes from
-  the map slice (no tomb tracking needed — no filter to drift).
-- `convertToSegmented()`: iterate flat map, feed all entries into the first
-  segment, nil `flat`.
+```
+key = xxh3(dir_inode_id ‖ name)   ← scoped per directory, globally unique
 
-**Rust (`bloomfs-dir`):**
-- Mirror: `flat: Option<HashMap<u64, Vec<DirEntry>>>`.
-- Same state machine, same threshold constant.
+GlobalFilter:
+    filter  BlockedFilter          // covers all live (dir, name) pairs
+    deleted map[uint64]struct{}    // exact tombstone set for deleted entries
 
-**FS + store layers:** directory serialization (`encodeDirPage` /
-`decodeDirPage`) reads `FlagDirSegmented` from the inode flags. Flat directories
-use a simpler encoding (count u32 + N × (nameLen u16 + inode u64 + name bytes));
-segmented directories use the existing page encoding. Both fit within the
-existing page-per-segment model.
+Lookup(dir_inode, name):
+    k = key(dir_inode, name)
+    if !filter.Test(k)  → ENOENT  // Bloom guarantees absence
+    if k ∈ deleted      → ENOENT  // precise negative knowledge
+    → do the actual directory map lookup
 
-**Tests:**
-- Unit: add 1, 100, FlatThreshold−1 entries → confirm flat mode throughout.
-- Unit: add FlatThreshold entries → confirm automatic conversion, all entries
-  present and findable after conversion.
-- Unit: remove in flat mode, add again → no FP drift (no filter to drift).
-- Benchmark: `BenchmarkFlatVsSegmented` at 50/100/200/500/1000/2000 entries,
-  hit and miss. Output determines the final `FlatThreshold` constant.
+Create(dir_inode, name):
+    k = key(dir_inode, name)
+    delete(deleted, k)             // handle re-create after delete
+    filter.Add(k)
 
-### Estimate
+Unlink(dir_inode, name):
+    k = key(dir_inode, name)
+    deleted[k] = struct{}{}
+    if len(deleted) >= RebuildThreshold { rebuild() }
+
+rebuild():
+    scan all live directory entries from the inode table
+    build a fresh filter from scratch
+    deleted = map[uint64]struct{}{}   // reset tombstone set
+```
+
+**Why `deleted` is better than a counting filter:**
+`deleted` serves two roles at once — it is the tombstone set that prevents
+stale Bloom bits from causing false positives, AND it is a precise negative
+cache: a deleted key returns ENOENT without touching the filter at all.
+A counting Bloom filter would cost 3–4× more memory per bit and is more
+complex; `deleted` is a plain hash set.
+
+**RebuildThreshold = 16 000**
+Memory before rebuild: 16 000 × ~16 bytes ≈ 256 KB — negligible. Rebuild
+walks the inode table (already in RAM for open filesystems) and inserts all
+live directory entries; cost is O(total files), amortized O(1) per delete.
+
+**Filter sizing:**
+At 1 M files, FP = 1 %: ~10 bits/entry → ~1.25 MB. This fits in L2/L3 cache.
+Sized once at mount from the live entry count; resized on rebuild if the
+live count has changed significantly (>2×).
+
+**On-disk persistence:**
+The global filter is rebuilt from the inode table on every mount — same as the
+existing dedup table reconstruction. No new on-disk format needed.
+
+### Directory layer becomes simple
+
+Directories are now **plain maps** at every size:
+
+```go
+type Directory struct {
+    index map[uint64][]dirEntry   // xxh3(name) → entries
+}
+```
+
+No segments, no per-directory filter, no tomb tracking. The `dir` package
+shrinks significantly; segment.go and bloom integration move to a new
+`globalfilter` package (or into the `fs` layer).
+
+On-disk serialization simplifies to: count u32 + N × (nameLen u16, inode u64,
+name bytes). The `FlagDirSegmented` inode bit is no longer needed.
+
+The existing `BenchmarkFlatVsSegmented` already benchmarks this path (the
+`flat` variant is exactly what the directory becomes). The global filter's
+impact is measured separately as a FUSE-level lookup benchmark (Phase E2).
+
+### Implementation order
 
 | Step | What | Est. |
 |------|------|------|
-| P0-bench | BenchmarkFlatVsSegmented, determine threshold | 0.5 h |
-| P0-go | flat mode in `dir` package + serialization | 2 h |
-| P0-rust | mirror in `bloomfs-dir` + serialization | 2 h |
-| P0-test | unit + benchmark suite, both impls | 1 h |
+| P0-dir | strip Bloom from `dir` package → plain map | 1 h |
+| P0-filter | `globalfilter` package: BlockedFilter + deleted map + rebuild | 2 h |
+| P0-fs | wire global filter into `fs.Lookup`, `fs.Create`, `fs.Unlink` | 1.5 h |
+| P0-rust | mirror in `bloomfs-dir` + `bloomfs-fs` | 3 h |
+| P0-test | unit (false-negative free, rebuild correctness) + benchmarks | 1.5 h |
 
-**Gate:** all subsequent phases (A–G) build on top of this. The directory is the
-hottest structure in the filesystem; getting its mode-switching right first means
-everything above it benefits automatically.
+**Gate:** all subsequent phases (A–G) build on this. The directory is the
+hottest path; moving the filter to the right level first means everything
+above benefits automatically.
 
 ---
 
