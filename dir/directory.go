@@ -2,9 +2,32 @@ package dir
 
 import "github.com/zeebo/xxh3"
 
+// FlatThreshold is the entry count at which a directory converts from flat
+// (map-only, no Bloom filter) to the Bloom-segmented structure.
+//
+// BenchmarkFlatVsSegmented (Xeon 2.80 GHz, Go) shows flat map wins at every
+// size up to 10 000 entries — the crossover was not observed in that range:
+//
+//	n=500   flat/miss=26ns  segmented/miss=38ns  (+46% for segmented)
+//	n=2000  flat/miss=30ns  segmented/miss=38ns  (+27% for segmented)
+//	n=10000 flat/miss=35ns  segmented/miss=48ns  (+37% for segmented)
+//
+// The segmented structure only wins when many segments chain together
+// (BenchmarkSweep: cap=16000/1-seg → 38ns vs cap=1000/16-seg → 458ns).
+// One large segment with a Bloom filter is near-competitive with the flat map,
+// but the map wins until the directory grows large enough that the filter's
+// cache footprint shrinks relative to the map's bucket array.
+//
+// Provisional value: 10 000. Extend BenchmarkFlatVsSegmented to 50 000–100 000
+// entries to locate the true crossover; update this constant accordingly.
+const FlatThreshold = 10_000
+
 // Directory is a logical directory: a linked list of virtual segments (§3.1).
 // A lookup walks the segments, and each segment's blocked Bloom filter rejects
 // non-members before any index access.
+//
+// Phase P0 will add a flat (map-only) mode for small directories that converts
+// to segmented automatically at FlatThreshold entries.
 //
 // Not safe for concurrent use in Stage A. Granular per-segment locking and
 // atomic filter swap come later (§B6).
@@ -13,6 +36,10 @@ type Directory struct {
 	cap      int     // per-segment capacity
 	fp       float64 // per-segment target false-positive rate
 }
+
+// IsFlat reports whether the directory is in flat (pre-threshold) mode.
+// Always false until Phase P0 implements the flat→segmented conversion.
+func (d *Directory) IsFlat() bool { return false }
 
 // New returns an empty directory with one segment ready, using the default
 // per-segment capacity and FP.
