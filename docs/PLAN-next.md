@@ -1,5 +1,116 @@
 # Implementation plan — next session
 
+## Architectural principle
+
+> **Features activate only when they provide measurable benefit.**
+> A structure that is always-on regardless of load is overhead, not a feature.
+> This applies to every layer: Bloom filters, segmentation, compression,
+> encryption, dedup — each should engage at the point where it pays for itself
+> and be invisible before that point.
+
+---
+
+## Priority 0 — adaptive directory mode (restructure first)
+
+**Problem:** every directory, even one with 3 files, currently carries a Bloom
+filter and segmented structure. This is overhead on the common case (small
+directories) for the benefit of the rare case (large directories). Real-world
+statistics show directories with >10 000 files are rare — and rare precisely
+because existing filesystems make them painful. BloomFS should fix the pain, not
+impose the cure on everyone.
+
+**Precedent:** ext4 does exactly this — new directories start as a flat linear
+list and convert to HTree (hash tree) only when they exceed a threshold. This is
+established practice.
+
+**Benchmark evidence** (16 000-file directory, Go, Xeon 2.80 GHz):
+```
+cap=1000  (16 segments): miss=458 ns, hit=260 ns
+cap=4000  ( 4 segments): miss=123 ns, hit=105 ns
+cap=16000 ( 1 segment):  miss= 38 ns, hit= 69 ns
+```
+A Go map on a 50-entry directory: ~20–30 ns miss — **faster than any segmented
+mode**. The Bloom filter pays off somewhere around 500–2000 entries; below that
+it adds latency and memory for zero gain.
+
+### Design
+
+```
+directory created
+    │
+    ▼
+FLAT mode: map[xxh3(name)]→[]dirEntry
+  – no filter, no segments
+  – one map, minimum allocations
+  – lookup: one xxh3 + one map probe → ~20 ns
+    │
+    │  len(flat) >= FlatThreshold (TBD by benchmark, ~500)
+    ▼
+convertToSegmented()   ← one-way, triggered on Add()
+    │
+    ▼
+SEGMENTED mode: current Bloom-segment chain
+  – Bloom filter per segment, XXH3-keyed
+  – engages only where it earns its keep
+```
+
+**On-disk representation:** the `Flags uint8` byte in the 128-byte inode has
+free bits. Add `FlagDirSegmented = 0x08` (or next free bit). Flat directories
+serialize as a plain key→inode list with no filter bytes; segmented directories
+serialize as today. The format is self-describing — no migration needed for
+existing images (they were always segmented; flat is new, opt-in by size).
+
+**FlatThreshold:** must be determined by benchmark, not guessed. Add
+`BenchmarkFlatVsSegmented` that measures a pure `map`-only lookup (no filter)
+vs the current segmented path at counts 50, 100, 200, 500, 1000, 2000. The
+crossover point becomes `FlatThreshold`. Likely 200–500.
+
+### Implementation
+
+**Go (`dir` package):**
+- `Directory` struct gains a `flat map[uint64][]dirEntry` field (nil when
+  segmented).
+- `Add`: if `flat != nil`, insert into flat map; if `len(flat) >= FlatThreshold`
+  call `convertToSegmented()` and nil out `flat`.
+- `Find`: if `flat != nil`, one map probe; otherwise existing segment-chain path.
+- `List`, `Remove`: flat path is trivial; Remove in flat mode just deletes from
+  the map slice (no tomb tracking needed — no filter to drift).
+- `convertToSegmented()`: iterate flat map, feed all entries into the first
+  segment, nil `flat`.
+
+**Rust (`bloomfs-dir`):**
+- Mirror: `flat: Option<HashMap<u64, Vec<DirEntry>>>`.
+- Same state machine, same threshold constant.
+
+**FS + store layers:** directory serialization (`encodeDirPage` /
+`decodeDirPage`) reads `FlagDirSegmented` from the inode flags. Flat directories
+use a simpler encoding (count u32 + N × (nameLen u16 + inode u64 + name bytes));
+segmented directories use the existing page encoding. Both fit within the
+existing page-per-segment model.
+
+**Tests:**
+- Unit: add 1, 100, FlatThreshold−1 entries → confirm flat mode throughout.
+- Unit: add FlatThreshold entries → confirm automatic conversion, all entries
+  present and findable after conversion.
+- Unit: remove in flat mode, add again → no FP drift (no filter to drift).
+- Benchmark: `BenchmarkFlatVsSegmented` at 50/100/200/500/1000/2000 entries,
+  hit and miss. Output determines the final `FlatThreshold` constant.
+
+### Estimate
+
+| Step | What | Est. |
+|------|------|------|
+| P0-bench | BenchmarkFlatVsSegmented, determine threshold | 0.5 h |
+| P0-go | flat mode in `dir` package + serialization | 2 h |
+| P0-rust | mirror in `bloomfs-dir` + serialization | 2 h |
+| P0-test | unit + benchmark suite, both impls | 1 h |
+
+**Gate:** all subsequent phases (A–G) build on top of this. The directory is the
+hottest structure in the filesystem; getting its mode-switching right first means
+everything above it benefits automatically.
+
+---
+
 Two remaining "honest scope" items toward a POSIX-clean filesystem. These are
 not bugs but deliberate scope edges left after the five durability/robustness
 fixes that are now at Rust↔Go parity.
@@ -108,14 +219,17 @@ run the cycle check in both directions.
 
 | Step | What | Est. |
 |------|------|------|
+| P0 | **Adaptive dir mode** (flat → segmented at threshold) | 5.5 h |
 | 0 | Recon + baseline tests | 0.5 h |
 | A | parent for `..` (Rust → Go) | 1.5–2 h |
 | B | renameat2 flags (FS → binding, Rust → Go) | 2–3 h |
 | C | parity, runs, 2 commits | 1 h |
 | D | commit dispatcher (dirty threshold + last-writer-close + idle timer) | 3.5 h |
+| E | Lean FUSE + validation suite | 1–2 weeks |
+| G | Kernel module | months; gate on E3 green |
 
-Do **A → B** (EXCHANGE relies on A's parent tracking). Rust first (flagship),
-then port to Go in one sitting.
+Do **P0 first** — it restructures the directory layer everything else sits on.
+Then **A → B** (EXCHANGE relies on A's parent tracking). Rust first throughout.
 
 **Main risk to keep in mind:** the temptation to put parent on disk. Don't — that
 is a 128-byte format migration just for `..`; the cost is disproportionate. RAM
