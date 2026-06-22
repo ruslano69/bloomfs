@@ -273,7 +273,13 @@ func (c *dirCache) remove(id uint64) {
 // Format creates a fresh filesystem on dev and returns it mounted. A nil key
 // selects a plaintext pool (§5.5 opt-out); otherwise key is the AES-XTS key.
 func Format(dev block.Device, key []byte) (*FS, error) {
-	if _, err := cow.Format(dev, defaultInodeCount, defaultDDTReserve); err != nil {
+	return FormatWith(dev, key, defaultInodeCount, defaultDDTReserve)
+}
+
+// FormatWith is Format with an explicit inode-table size and DDT reservation, for
+// callers (e.g. large-archive benchmarks) that need more than the defaults.
+func FormatWith(dev block.Device, key []byte, inodeCount, ddtReserve uint64) (*FS, error) {
+	if _, err := cow.Format(dev, inodeCount, ddtReserve); err != nil {
 		return nil, err
 	}
 	f, err := Mount(dev, key)
@@ -294,8 +300,18 @@ func Format(dev block.Device, key []byte) (*FS, error) {
 }
 
 // Mount opens an existing filesystem on dev. key must match how it was formatted
-// (nil for a plaintext pool).
+// (nil for a plaintext pool). The membership gate is rebuilt by walking the tree.
 func Mount(dev block.Device, key []byte) (*FS, error) {
+	return MountWithGate(dev, key, nil)
+}
+
+// MountWithGate is Mount with a previously persisted gate snapshot (from
+// SnapshotGate). If the snapshot is present and still matches the committed state
+// (its stamped uberblock seq equals the mounted one), the gate is loaded directly
+// — skipping the tree walk that rebuilding it would otherwise cost. A stale,
+// corrupt or nil snapshot falls back to the walk, so the snapshot is only ever a
+// cache, never authoritative.
+func MountWithGate(dev block.Device, key []byte, gateSnapshot []byte) (*FS, error) {
 	ub, bm, ddt, inodes, err := cow.Mount(dev)
 	if err != nil {
 		return nil, err
@@ -317,8 +333,40 @@ func Mount(dev block.Device, key []byte) (*FS, error) {
 		clock:      func() uint64 { return uint64(time.Now().UnixNano()) },
 		metaBuf:    make([]byte, ub.MetaBlocks*block.Size),
 	}
-	f.buildGate()
+	f.installGate(gateSnapshot)
 	return f, nil
+}
+
+// installGate loads the gate from a valid snapshot (seq matches the committed
+// state), else rebuilds it by walking the tree.
+func (f *FS) installGate(snapshot []byte) {
+	if len(snapshot) >= 8 && binary.LittleEndian.Uint64(snapshot) == f.ub.Seq {
+		if g, err := globalfilter.UnmarshalGate(snapshot[8:]); err == nil {
+			f.gate = g
+			f.gateEnabled = true
+			return
+		}
+	}
+	f.buildGate()
+}
+
+// SnapshotGate serializes the gate, stamped with the current uberblock seq, so a
+// later MountWithGate can skip the tree walk while the committed state is
+// unchanged. Take it after the final commit, before unmount.
+func (f *FS) SnapshotGate() ([]byte, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.gate == nil {
+		return nil, nil
+	}
+	gb, err := f.gate.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 8+len(gb))
+	binary.LittleEndian.PutUint64(out, f.ub.Seq)
+	copy(out[8:], gb)
+	return out, nil
 }
 
 // buildGate populates the membership gate from the committed tree. A fresh Format

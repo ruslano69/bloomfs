@@ -1,6 +1,8 @@
 package globalfilter
 
 import (
+	"encoding/binary"
+	"errors"
 	"sync"
 
 	bloom "github.com/ruslano69/xxh3-bloom"
@@ -111,4 +113,56 @@ func (g *Gate) Tombstones() int {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return len(g.deleted)
+}
+
+// gateSnapMagic tags a serialized gate so a stray blob is rejected instead of
+// misread.
+const gateSnapMagic = 0x47415445_00000001 // "GATE" + v1
+
+// MarshalBinary serializes the gate (filter + tombstones + sizing) so a mount can
+// load it instead of re-walking the tree. The fs wraps this with a validity stamp
+// (the uberblock seq) and persists it; on a stale or absent snapshot it falls back
+// to the tree walk, so this is a cache, never the source of truth.
+func (g *Gate) MarshalBinary() ([]byte, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	fb, err := g.filter.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 32, 32+len(g.deleted)*8+len(fb))
+	binary.LittleEndian.PutUint64(out[0:], gateSnapMagic)
+	binary.LittleEndian.PutUint64(out[8:], uint64(g.capacity))
+	binary.LittleEndian.PutUint64(out[16:], uint64(g.live))
+	binary.LittleEndian.PutUint64(out[24:], uint64(len(g.deleted)))
+	var kb [8]byte
+	for k := range g.deleted {
+		binary.LittleEndian.PutUint64(kb[:], k)
+		out = append(out, kb[:]...)
+	}
+	return append(out, fb...), nil
+}
+
+// UnmarshalGate reconstructs a Gate from MarshalBinary output.
+func UnmarshalGate(data []byte) (*Gate, error) {
+	if len(data) < 32 || binary.LittleEndian.Uint64(data) != gateSnapMagic {
+		return nil, errors.New("globalfilter: not a gate snapshot")
+	}
+	capacity := int(binary.LittleEndian.Uint64(data[8:]))
+	live := int(binary.LittleEndian.Uint64(data[16:]))
+	tombN := int(binary.LittleEndian.Uint64(data[24:]))
+	off := 32
+	deleted := make(map[uint64]struct{}, tombN)
+	for i := 0; i < tombN; i++ {
+		if off+8 > len(data) {
+			return nil, errors.New("globalfilter: truncated gate snapshot")
+		}
+		deleted[binary.LittleEndian.Uint64(data[off:])] = struct{}{}
+		off += 8
+	}
+	f := &bloom.BlockedFilter{}
+	if err := f.UnmarshalBinary(data[off:]); err != nil {
+		return nil, err
+	}
+	return &Gate{filter: f, deleted: deleted, live: live, capacity: capacity}, nil
 }

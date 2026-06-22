@@ -184,5 +184,92 @@ func TestGateNoFalseNegativeOnColdHit(t *testing.T) {
 	}
 }
 
+// TestGateSnapshotSkipsMountWalk is the final-optimization measurement: a mount
+// that loads the persisted gate snapshot reads far fewer blocks than one that
+// rebuilds the gate by walking the tree — and stays correct.
+func TestGateSnapshotSkipsMountWalk(t *testing.T) {
+	cd := &countingDev{Device: block.NewMem(4096)}
+	f, err := Format(cd, testKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := f.Root()
+	const dirs, filesPer = 500, 3
+	for i := 0; i < dirs; i++ {
+		id, err := f.Mkdir(root, dirName(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for j := 0; j < filesPer; j++ {
+			if _, err := f.Create(id, fileName(j)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := f.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := f.SnapshotGate()
+	if err != nil || len(snap) == 0 {
+		t.Fatalf("snapshot: %v (len %d)", err, len(snap))
+	}
+
+	// Mount A: rebuild by walking the tree.
+	cd.reads = 0
+	if _, err := Mount(cd, testKey()); err != nil {
+		t.Fatal(err)
+	}
+	walkReads := cd.reads
+
+	// Mount B: load the snapshot — no tree walk.
+	cd.reads = 0
+	fb, err := MountWithGate(cd, testKey(), snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadReads := cd.reads
+
+	// walk = metadata-mount floor + one load per directory; snapshot = floor only.
+	// The win is the eliminated per-directory walk (~dirs reads), which scales with
+	// the tree while the floor is fixed.
+	eliminated := walkReads - loadReads
+	t.Logf("mount ReadBlock: walk=%d, snapshot=%d -> walk eliminated %d (~%d dirs); snapshot pays only the metadata floor",
+		walkReads, loadReads, eliminated, dirs)
+	if eliminated < dirs {
+		t.Fatalf("snapshot did not eliminate the per-dir walk: walk=%d load=%d eliminated=%d, want >= %d",
+			walkReads, loadReads, eliminated, dirs)
+	}
+
+	// Correctness of the snapshot-loaded gate: a real file in a cold dir is found,
+	// an absent name is gated away.
+	dirID, ok, _ := fb.Lookup(root, dirName(7))
+	if !ok {
+		t.Fatal("dir7 missing after snapshot mount")
+	}
+	fb.dcache.remove(dirID)
+	if _, ok, _ := fb.Lookup(dirID, fileName(1)); !ok {
+		t.Fatal("false negative: real file not found via snapshot-loaded gate")
+	}
+	fb.dcache.remove(dirID)
+	if _, ok, _ := fb.Lookup(dirID, "ghost"); ok {
+		t.Fatal("phantom hit via snapshot-loaded gate")
+	}
+
+	// A stale snapshot (state advanced past its seq) must fall back to the walk.
+	if _, err := fb.Create(root, "newcomer"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fb.Commit(); err != nil { // seq advances; snap is now stale
+		t.Fatal(err)
+	}
+	stale, err := MountWithGate(cd, testKey(), snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := stale.Lookup(root, "newcomer"); !ok {
+		t.Fatal("stale snapshot accepted: newcomer not found (gate not rebuilt)")
+	}
+}
+
 func dirName(i int) string  { return "dir" + strconv.Itoa(i) }
 func fileName(j int) string { return "f" + strconv.Itoa(j) }
