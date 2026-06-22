@@ -33,6 +33,7 @@ import (
 	"github.com/ruslano69/bloomfs/cow"
 	"github.com/ruslano69/bloomfs/dedup"
 	"github.com/ruslano69/bloomfs/dir"
+	"github.com/ruslano69/bloomfs/globalfilter"
 	"github.com/ruslano69/bloomfs/inode"
 	"github.com/ruslano69/bloomfs/store"
 )
@@ -102,6 +103,14 @@ type FS struct {
 	// sized to one metadata slot and reused across commits so a commit allocates
 	// nothing (it is only ever touched under the write lock during commitLocked).
 	metaBuf []byte
+
+	// gate is the filesystem-wide membership oracle (Phase P0): on a Lookup whose
+	// directory is NOT resident in dcache, it rejects a true miss without loading
+	// the directory from disk. Built at Mount by walking the tree, kept current by
+	// Add/Remove on every name mutation. gateEnabled lets a benchmark turn it off
+	// to measure the cold-load it avoids.
+	gate        *globalfilter.Gate
+	gateEnabled bool
 }
 
 // dirPageSize is the directory persistence unit: one entry list is split across
@@ -295,7 +304,7 @@ func Mount(dev block.Device, key []byte) (*FS, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &FS{
+	f := &FS{
 		dev:        dev,
 		ub:         ub,
 		bm:         bm,
@@ -307,7 +316,88 @@ func Mount(dev block.Device, key []byte) (*FS, error) {
 		freeInodes: rebuildFreeInodes(inodes),
 		clock:      func() uint64 { return uint64(time.Now().UnixNano()) },
 		metaBuf:    make([]byte, ub.MetaBlocks*block.Size),
-	}, nil
+	}
+	f.buildGate()
+	return f, nil
+}
+
+// buildGate populates the membership gate from the committed tree. A fresh Format
+// has no tree yet (root is created after Mount returns), so the gate starts at the
+// floor size and Create/Mkdir fill it incrementally — still complete.
+func (f *FS) buildGate() {
+	f.gate = f.walkBuildGate()
+	f.gateEnabled = true
+}
+
+// rebuildGate re-sizes the gate to the current live set, dropping accumulated
+// tombstones. Called from commit (a consistent, write-locked point) when the gate
+// reports NeedsRebuild — never mid-mutation, where a re-walk could re-read an
+// evicted directory from disk before its change was flushed (§gate).
+func (f *FS) rebuildGate() { f.gate = f.walkBuildGate() }
+
+// walkBuildGate walks every directory once (a cost like DDT/index reconstruction,
+// §B3 — and unavoidable here because names live in directory data, not the RAM
+// inode table), gathers all live (dir, name) pairs, sizes a fresh gate to that
+// count, and admits them.
+func (f *FS) walkBuildGate() *globalfilter.Gate {
+	type pair struct {
+		dir  uint64
+		name string
+	}
+	var pairs []pair
+	seen := make(map[uint64]bool)
+	var walk func(id uint64)
+	walk = func(id uint64) {
+		if seen[id] {
+			return // acyclic tree (no dir hardlinks), but cheap insurance
+		}
+		seen[id] = true
+		h, err := f.openDir(id)
+		if err != nil {
+			return
+		}
+		for _, e := range h.dir.Entries() {
+			pairs = append(pairs, pair{id, e.Name})
+			if child, err := f.inodes.Get(uint64(e.Inode)); err == nil && child.Type == inode.TypeDir {
+				walk(uint64(e.Inode))
+			}
+		}
+	}
+	root := f.ub.RootInode
+	if in, err := f.inodes.Get(root); err == nil && in.Type == inode.TypeDir {
+		walk(root)
+	}
+	g := globalfilter.NewGate(len(pairs))
+	for _, p := range pairs {
+		g.Add(p.dir, p.name)
+	}
+	return g
+}
+
+// gateAdd / gateRemove keep the membership gate current on a name mutation. They
+// are no-ops if the gate is not yet built (early Format). The filter never shrinks
+// or re-sizes here — that happens at commit via maybeRebuildGate — so these stay
+// O(1) and a saturated filter only costs extra loads (never wrong answers) until
+// the next commit.
+func (f *FS) gateAdd(dirIno uint64, name string) {
+	if f.gate != nil {
+		f.gate.Add(dirIno, name)
+	}
+}
+
+func (f *FS) gateRemove(dirIno uint64, name string) {
+	if f.gate != nil {
+		f.gate.Remove(dirIno, name)
+	}
+}
+
+// maybeRebuildGate re-sizes the gate if it has outgrown its tuning. Called at the
+// end of a successful commit, where the on-disk tree is consistent and the write
+// lock is held.
+func (f *FS) maybeRebuildGate() {
+	if f.gate != nil && f.gateEnabled && f.gate.NeedsRebuild() {
+		f.rebuildGate()
+	}
 }
 
 // touchMod stamps an inode's modification time and metadata-change time (§F6):
@@ -359,6 +449,9 @@ func (f *FS) commitLocked() error {
 		return err
 	}
 	f.ub = ub
+	// The committed tree is now consistent on disk; this is the safe point to
+	// re-size the membership gate if it has outgrown its tuning (§gate).
+	f.maybeRebuildGate()
 	return nil
 }
 
@@ -649,6 +742,19 @@ func (f *FS) flushDir(id uint64, h *cachedDir) error {
 func (f *FS) Lookup(parent uint64, name string) (uint64, bool, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	// Resident directory: its cached index is authoritative — go straight to it,
+	// no filter (the gate is purely a cold-directory optimization).
+	if h, ok := f.dcache.load(parent); ok {
+		id, ok := h.dir.Find(name)
+		return uint64(id), ok, nil
+	}
+	// Cold directory: the membership gate rejects a true miss WITHOUT loading the
+	// directory from disk — the filter's real payoff (an avoided read + decrypt +
+	// decompress + index rebuild).
+	if f.gateEnabled && f.gate != nil && !f.gate.Test(parent, name) {
+		return 0, false, nil
+	}
+	// Maybe-hit (or gate disabled): load the directory and resolve authoritatively.
 	h, err := f.openDir(parent)
 	if err != nil {
 		return 0, false, err
@@ -930,6 +1036,7 @@ func (f *FS) createLocked(parent uint64, name string, typ uint8, mode uint16) (u
 		return 0, err
 	}
 	h.add(name, dir.InodeID(id))
+	f.gateAdd(parent, name)
 	// A new subdirectory's ".." links back to the parent, so the parent's link
 	// count grows by one (POSIX directory nlink). flushDir persists h.in below.
 	if typ == inode.TypeDir {
@@ -1251,6 +1358,7 @@ func (f *FS) Unlink(parent uint64, name string) error {
 	}
 
 	h.del(name)
+	f.gateRemove(parent, name)
 	if err := f.flushDir(parent, h); err != nil {
 		return err
 	}
@@ -1296,6 +1404,7 @@ func (f *FS) Rmdir(parent uint64, name string) error {
 	}
 
 	h.del(name)
+	f.gateRemove(parent, name)
 	if h.in.Nlink > 0 {
 		h.in.Nlink-- // the child's ".." no longer counts toward the parent
 	}
@@ -1397,6 +1506,7 @@ func (f *FS) Link(parent uint64, name string, targetID uint64) error {
 		return err
 	}
 	h.add(name, dir.InodeID(targetID))
+	f.gateAdd(parent, name)
 	return f.flushDir(parent, h)
 }
 
@@ -1505,10 +1615,13 @@ func (f *FS) Rename(srcParent uint64, srcName string, dstParent uint64, dstName 
 			}
 		}
 		dh.del(dstName)
+		f.gateRemove(dstParent, dstName)
 	}
 
 	dh.add(dstName, id)
+	f.gateAdd(dstParent, dstName)
 	sh.del(srcName)
+	f.gateRemove(srcParent, srcName)
 
 	// The renamed inode's ctime changes (its link/location changed), §F6.
 	if moved, err := f.inodes.Get(uint64(id)); err == nil {

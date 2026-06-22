@@ -17,3 +17,8 @@ require (
 	github.com/twmb/murmur3 v1.1.8 // indirect
 	golang.org/x/sys v0.30.0 // indirect
 )
+
+// P0 prototype: use the local xxh3-bloom working tree to exercise the new
+// hashed-input fast path (AddHash/TestHash). Revert to the tagged release once
+// those methods are published.
+replace github.com/ruslano69/xxh3-bloom => ../bloom
