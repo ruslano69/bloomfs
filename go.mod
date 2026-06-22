@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/hanwen/go-fuse/v2 v2.10.1
 	github.com/klauspost/compress v1.18.0
-	github.com/ruslano69/xxh3-bloom v0.8.0
+	github.com/ruslano69/xxh3-bloom v0.9.0
 	github.com/zeebo/xxh3 v1.1.0
 	golang.org/x/crypto v0.33.0
 )
@@ -17,8 +17,3 @@ require (
 	github.com/twmb/murmur3 v1.1.8 // indirect
 	golang.org/x/sys v0.30.0 // indirect
 )
-
-// P0 prototype: use the local xxh3-bloom working tree to exercise the new
-// hashed-input fast path (AddHash/TestHash). Revert to the tagged release once
-// those methods are published.
-replace github.com/ruslano69/xxh3-bloom => ../bloom
